@@ -16,10 +16,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import uuid
+import hashlib
+import time
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from cachetools import TTLCache
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import google.generativeai as genai
@@ -202,6 +206,15 @@ conversation_histories: Dict[str, List[Dict[str, str]]] = {}
 # Processing status tracker
 processing_status: Dict[str, Dict[str, Any]] = {}
 
+# Query result cache (TTL: 5 minutes, max 100 entries)
+query_cache: TTLCache = TTLCache(maxsize=100, ttl=300)
+
+# Performance metrics storage
+performance_metrics: Dict[str, List[float]] = {
+    "query_times": [],
+    "processing_times": [],
+}
+
 # Base paths
 BASE_DIR = Path(__file__).parent.parent
 STORAGE_DIR = BASE_DIR / "storage"
@@ -314,6 +327,13 @@ class QueryRequest(BaseModel):
     return_metadata: bool = Field(True, description="Include detailed metadata in response")
     enable_web_search: bool = Field(False, description="Enable web search augmentation")
     web_search_only: bool = Field(False, description="Use only web search (no RAG)")
+    enable_verification: bool = Field(True, description="Enable dual-LLM verification")
+    # Performance optimization parameters
+    fast_mode: bool = Field(False, description="Use optimized parameters for faster queries (2-3x speedup)")
+    top_k: Optional[int] = Field(None, description="Number of top results to retrieve (default: 40, fast: 20)")
+    enable_cache: bool = Field(True, description="Enable query result caching")
+    enable_query_improvement: bool = Field(True, description="Enable query improvement/expansion")
+    enable_verification_check: bool = Field(True, description="Enable verification step (separate from enable_verification)")
 
     class Config:
         json_schema_extra = {
@@ -324,7 +344,8 @@ class QueryRequest(BaseModel):
                 "conversation_id": "conv_123",
                 "return_metadata": True,
                 "enable_web_search": False,
-                "web_search_only": False
+                "web_search_only": False,
+                "enable_verification": True
             }
         }
 
@@ -362,6 +383,15 @@ class UploadResponse(BaseModel):
     file_name: str
     domain: str
     processing_id: str
+
+
+class BatchUploadResponse(BaseModel):
+    success: bool
+    message: str
+    total_files: int
+    accepted_files: int
+    processing_ids: List[str]
+    domain: str
 
 
 class URLUploadRequest(BaseModel):
@@ -439,6 +469,10 @@ async def gemini_llm_func(
                 config_params["temperature"] = kwargs["temperature"]
             if "max_tokens" in kwargs:
                 config_params["max_output_tokens"] = kwargs["max_tokens"]
+            else:
+                # Default to larger token limit to avoid MAX_TOKENS errors
+                config_params["max_output_tokens"] = 8192
+
             generation_config = genai.types.GenerationConfig(**config_params)
 
             # --- IMPROVEMENT: Build structured history for chat model ---
@@ -506,6 +540,9 @@ async def gemini_verifier_llm_func(
                 config_params["temperature"] = kwargs["temperature"]
             if "max_tokens" in kwargs:
                 config_params["max_output_tokens"] = kwargs["max_tokens"]
+            else:
+                # Default to larger token limit for verification responses
+                config_params["max_output_tokens"] = 8192
             generation_config = genai.types.GenerationConfig(**config_params)
 
             # Build history
@@ -698,19 +735,27 @@ Based on the web search results above, provide a clear and comprehensive answer 
         return web_context
 
 
-async def gemini_rerank_func(query: str, chunks: List[Dict[str, Any]], top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+async def gemini_rerank_func(query: str, documents: List[str], top_n: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     Gemini-based reranking function for LightRAG
 
+    This follows LightRAG's reranking API signature which expects:
+    - documents: List of strings (not dict chunks)
+    - top_n: Number of top results (not top_k)
+    - Returns: List of {"index": int, "relevance_score": float}
+
     Args:
         query: Search query
-        chunks: List of chunks to rerank
-        top_k: Number of top chunks to return (None = return all, reranked)
+        documents: List of document strings to rerank
+        top_n: Number of top documents to return (None = return all, reranked)
 
     Returns:
-        Reranked list of chunks
+        List of {"index": int, "relevance_score": float} in descending score order
     """
     try:
+        # Convert documents (strings) to chunks format for our reranker
+        chunks = [{"content": doc} for doc in documents]
+
         # Initialize reranker with Gemini LLM function
         reranker = GeminiReranker(
             llm_func=gemini_llm_func,
@@ -719,15 +764,32 @@ async def gemini_rerank_func(query: str, chunks: List[Dict[str, Any]], top_k: Op
         )
 
         # Perform reranking
-        reranked_chunks = await reranker.rerank(query, chunks, top_k)
+        reranked_chunks = await reranker.rerank(query, chunks, top_n)
 
-        logger.debug(f"Reranked {len(chunks)} chunks, returning {len(reranked_chunks)}")
-        return reranked_chunks
+        # Convert back to LightRAG format: List[{"index": int, "relevance_score": float}]
+        results = []
+        for i, chunk in enumerate(reranked_chunks):
+            # Find original index of this chunk
+            original_content = chunk.get("content", "")
+            try:
+                original_index = documents.index(original_content)
+            except ValueError:
+                # Fallback: use current index if not found
+                original_index = i
+
+            results.append({
+                "index": original_index,
+                "relevance_score": chunk.get("relevance_score", 0.0)
+            })
+
+        logger.debug(f"Reranked {len(documents)} documents, returning {len(results)} results")
+        return results
 
     except Exception as e:
         logger.error(f"Reranking error: {e}", exc_info=True)
-        # Return original chunks on error
-        return chunks[:top_k] if top_k else chunks
+        # Return original order on error - format: List[{"index": int, "relevance_score": float}]
+        result_count = top_n if top_n and top_n < len(documents) else len(documents)
+        return [{"index": i, "relevance_score": 1.0} for i in range(result_count)]
 
 
 # =============================================================================
@@ -901,6 +963,182 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
+@app.post("/upload-batch", response_model=BatchUploadResponse)
+async def upload_documents_batch(
+    files: List[UploadFile] = File(...),
+    domain: str = Form(...),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Upload and process multiple documents in batch using optimized processing.
+
+    Uses BatchOptimizer for 2-3x faster processing through:
+    - Parallel parsing (up to 4 documents simultaneously)
+    - Parallel processing (up to 10 documents simultaneously)
+    - Pipeline architecture (parse + process in parallel)
+    """
+    logger.info(f"Batch upload request: {len(files)} files to domain: {domain}")
+    try:
+        if domain not in DOMAIN_CONFIGS:
+            raise HTTPException(400, f"Invalid domain. Valid: {list(DOMAIN_CONFIGS.keys())}")
+
+        allowed_extensions = DOMAIN_CONFIGS[domain]["file_extensions"]
+        domain_upload_dir = UPLOAD_DIR / domain
+        domain_upload_dir.mkdir(parents=True, exist_ok=True)
+
+        # Process and save all files
+        file_paths = []
+        processing_ids = []
+        rejected_files = []
+
+        for file in files:
+            file_ext = Path(file.filename).suffix.lower()
+            if file_ext not in allowed_extensions:
+                rejected_files.append(file.filename)
+                logger.warning(f"Rejected file {file.filename}: extension {file_ext} not allowed")
+                continue
+
+            processing_id = str(uuid.uuid4())
+            file_path = domain_upload_dir / f"{processing_id}_{file.filename}"
+
+            with open(file_path, "wb") as f:
+                f.write(await file.read())
+
+            file_paths.append(str(file_path))
+            processing_ids.append(processing_id)
+
+            # Initialize status for each file
+            processing_status[processing_id] = {
+                "status": "queued",
+                "message": "Queued for batch processing...",
+                "file_name": file.filename,
+                "started_at": datetime.now().isoformat()
+            }
+
+        logger.info(f"Accepted {len(file_paths)}/{len(files)} files, rejected: {rejected_files}")
+
+        if not file_paths:
+            raise HTTPException(400, f"No valid files provided. Allowed extensions: {allowed_extensions}")
+
+        # Process documents in batch using optimized processing
+        async def process_batch_task():
+            start_time = time.time()
+            try:
+                logger.info(f"Starting optimized batch processing of {len(file_paths)} files")
+                rag = await get_rag_instance(domain)
+
+                # Use optimized batch processing if available
+                if hasattr(rag, 'process_documents_batch_optimized'):
+                    result = await rag.process_documents_batch_optimized(
+                        file_paths=file_paths,
+                        max_concurrent_parsers=4,  # MinerU optimal
+                        max_concurrent_processors=10,  # Higher for I/O-bound tasks
+                        enable_progress_tracking=True,
+                    )
+
+                    # Update statuses based on results
+                    successful_files = result.get('successful_files', [])
+                    failed_files = result.get('failed_files', {})
+
+                    for idx, file_path in enumerate(file_paths):
+                        processing_id = processing_ids[idx]
+                        filename = Path(file_path).name.split('_', 1)[1] if '_' in Path(file_path).name else Path(file_path).name
+
+                        if file_path in successful_files:
+                            processing_status[processing_id] = {
+                                "status": "completed",
+                                "message": "Document processed successfully",
+                                "file_name": filename,
+                                "completed_at": datetime.now().isoformat()
+                            }
+                        elif file_path in failed_files:
+                            error_msg = failed_files[file_path]
+                            processing_status[processing_id] = {
+                                "status": "failed",
+                                "message": f"Processing failed: {error_msg}",
+                                "file_name": filename,
+                                "error": error_msg
+                            }
+
+                    total_time = time.time() - start_time
+                    throughput = len(successful_files) / total_time if total_time > 0 else 0
+                    logger.info(
+                        f"Batch processing complete: {len(successful_files)}/{len(file_paths)} successful "
+                        f"in {total_time:.2f}s ({throughput:.2f} docs/sec)"
+                    )
+
+                    # Track performance
+                    performance_metrics["processing_times"].append(total_time)
+                    if len(performance_metrics["processing_times"]) > 100:
+                        performance_metrics["processing_times"] = performance_metrics["processing_times"][-100:]
+
+                else:
+                    # Fallback: process sequentially
+                    logger.warning("Optimized batch processing not available, using sequential processing")
+                    for idx, file_path in enumerate(file_paths):
+                        processing_id = processing_ids[idx]
+                        filename = Path(file_path).name.split('_', 1)[1] if '_' in Path(file_path).name else Path(file_path).name
+
+                        processing_status[processing_id]["status"] = "processing"
+                        processing_status[processing_id]["message"] = "Processing document..."
+
+                        try:
+                            result = await rag.process_document_complete(file_path)
+                            if result is None or (isinstance(result, dict) and result.get("success") is not False):
+                                processing_status[processing_id] = {
+                                    "status": "completed",
+                                    "message": "Document processed successfully",
+                                    "file_name": filename,
+                                    "completed_at": datetime.now().isoformat()
+                                }
+                            else:
+                                error_msg = result.get('error', 'Unknown error') if isinstance(result, dict) else "Processing error"
+                                processing_status[processing_id] = {
+                                    "status": "failed",
+                                    "message": f"Processing failed: {error_msg}",
+                                    "file_name": filename,
+                                    "error": error_msg
+                                }
+                        except Exception as e:
+                            logger.error(f"Error processing {filename}: {e}", exc_info=True)
+                            processing_status[processing_id] = {
+                                "status": "failed",
+                                "message": f"Error: {str(e)}",
+                                "file_name": filename,
+                                "error": str(e)
+                            }
+
+            except Exception as e:
+                logger.error(f"Batch processing error: {e}", exc_info=True)
+                # Mark all as failed
+                for idx, file_path in enumerate(file_paths):
+                    processing_id = processing_ids[idx]
+                    filename = Path(file_path).name.split('_', 1)[1] if '_' in Path(file_path).name else Path(file_path).name
+                    processing_status[processing_id] = {
+                        "status": "failed",
+                        "message": f"Batch processing error: {str(e)}",
+                        "file_name": filename,
+                        "error": str(e)
+                    }
+
+        background_tasks.add_task(process_batch_task)
+
+        return BatchUploadResponse(
+            success=True,
+            message=f"Batch upload queued: {len(file_paths)} files accepted" + (f", {len(rejected_files)} rejected" if rejected_files else ""),
+            total_files=len(files),
+            accepted_files=len(file_paths),
+            processing_ids=processing_ids,
+            domain=domain
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Batch upload error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Batch upload failed: {str(e)}")
+
+
 @app.post("/upload-url", response_model=UploadResponse)
 async def upload_url(
     request: URLUploadRequest,
@@ -1044,13 +1282,120 @@ async def upload_url(
         raise HTTPException(status_code=500, detail=f"URL upload failed: {str(e)}")
 
 
+@app.post("/query/stream")
+async def query_documents_stream(request: QueryRequest):
+    """
+    Stream query responses with real-time token generation and verification.
+
+    This endpoint provides Server-Sent Events (SSE) streaming for real-time
+    response generation while maintaining dual-LLM verification.
+    """
+    logger.info(f"Streaming query request: '{request.query[:50]}...' in domain: {request.domain}")
+
+    async def generate_sse():
+        """Generate Server-Sent Events stream"""
+        import json
+
+        try:
+            conversation_id = request.conversation_id or f"conv_{uuid.uuid4()}"
+
+            # Get RAG instance
+            rag = await get_rag_instance(request.domain)
+
+            # Determine optimal parameters based on fast_mode
+            if request.fast_mode:
+                # Optimized parameters for 2-3x speedup
+                top_k = request.top_k if request.top_k is not None else 20
+                chunk_top_k = 10
+                max_entity_tokens = 4000
+                max_relation_tokens = 6000
+                max_total_tokens = 20000
+                logger.info(f"⚡ Fast mode enabled for streaming: top_k={top_k}, chunk_top_k={chunk_top_k}")
+            else:
+                # Default parameters (higher quality, slower)
+                top_k = request.top_k if request.top_k is not None else 40
+                chunk_top_k = 20
+                max_entity_tokens = 6000
+                max_relation_tokens = 8000
+                max_total_tokens = 30000
+
+            # Log toggle settings
+            logger.info(f"Query settings - improvement: {request.enable_query_improvement}, verification: {request.enable_verification_check}")
+
+            # Stream the query with optimized parameters and user-controlled toggles
+            async for chunk in rag.aquery_stream(
+                query=request.query,
+                mode=request.mode,
+                enable_verification=request.enable_verification_check,  # Use toggle instead of always true
+                enable_query_improvement=request.enable_query_improvement,  # Use toggle instead of always true
+                top_k=top_k,
+                chunk_top_k=chunk_top_k,
+                max_entity_tokens=max_entity_tokens,
+                max_relation_tokens=max_relation_tokens,
+                max_total_tokens=max_total_tokens
+            ):
+                chunk_type = chunk.get("type", "token")
+                content = chunk.get("content", "")
+                done = chunk.get("done", False)
+
+                if chunk_type == "token":
+                    # Stream token
+                    data = {"type": "token", "content": content, "done": done}
+                    yield f"event: token\ndata: {json.dumps(data)}\n\n"
+
+                elif chunk_type == "verification":
+                    # Send verification metadata
+                    data = {"type": "verification", "content": content, "done": done}
+                    yield f"event: verification\ndata: {json.dumps(data)}\n\n"
+
+                elif chunk_type == "error":
+                    # Send error
+                    data = {"type": "error", "content": content, "done": True}
+                    yield f"event: error\ndata: {json.dumps(data)}\n\n"
+                    break
+
+            # Send completion event
+            yield f"event: done\ndata: {json.dumps({'message': 'Stream complete', 'conversation_id': conversation_id})}\n\n"
+
+        except Exception as e:
+            logger.error(f"Streaming error: {e}", exc_info=True)
+            error_data = {"type": "error", "content": {"message": str(e)}, "done": True}
+            yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
+
+    return StreamingResponse(
+        generate_sse(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query_documents(request: QueryRequest):
     """Query documents with enhanced RAG capabilities and optional web search."""
-    logger.info(f"Query request: '{request.query[:50]}...' in domain: {request.domain}, web_search={request.enable_web_search}")
+    start_time = time.time()
+    logger.info(f"Query request: '{request.query[:50]}...' in domain: {request.domain}, mode: {request.mode}, fast_mode: {request.fast_mode}")
+
     try:
         conversation_id = request.conversation_id or f"conv_{uuid.uuid4()}"
         conversation_history = conversation_histories.get(conversation_id, [])
+
+        # Generate cache key for non-web-search queries
+        cache_key = None
+        if request.enable_cache and not request.web_search_only and not request.enable_web_search:
+            cache_data = f"{request.query}:{request.domain}:{request.mode}:{request.fast_mode}:{request.enable_verification}"
+            cache_key = hashlib.md5(cache_data.encode()).hexdigest()
+
+            # Check cache
+            if cache_key in query_cache:
+                cached_response = query_cache[cache_key]
+                logger.info(f"✓ Cache hit for query (saved {time.time() - start_time:.2f}s)")
+                # Update conversation ID in cached response
+                cached_response.conversation_id = conversation_id
+                return cached_response
 
         # Handle web search only mode
         if request.web_search_only:
@@ -1081,14 +1426,46 @@ async def query_documents(request: QueryRequest):
                 "sources": [{"url": r.get("url"), "title": r.get("title")} for r in web_results.get("results", [])]
             }
         else:
-            # Standard RAG query
+            # Standard RAG query with optimized parameters
             rag = await get_rag_instance(request.domain)
+
+            # Determine optimal parameters based on fast_mode
+            if request.fast_mode:
+                # Optimized parameters for 2-3x speedup
+                top_k = request.top_k if request.top_k is not None else 20
+                chunk_top_k = 10
+                max_entity_tokens = 4000
+                max_relation_tokens = 6000
+                max_total_tokens = 20000
+                logger.info(f"⚡ Fast mode enabled: top_k={top_k}, chunk_top_k={chunk_top_k}")
+            else:
+                # Default parameters (higher quality, slower)
+                top_k = request.top_k if request.top_k is not None else 40
+                chunk_top_k = 20
+                max_entity_tokens = 6000
+                max_relation_tokens = 8000
+                max_total_tokens = 30000
+
+            # Build query parameters
+            from lightrag import QueryParam
+            query_kwargs = {
+                "top_k": top_k,
+                "chunk_top_k": chunk_top_k,
+                "max_entity_tokens": max_entity_tokens,
+                "max_relation_tokens": max_relation_tokens,
+                "max_total_tokens": max_total_tokens,
+            }
+
+            # Log toggle settings
+            logger.info(f"Query settings - improvement: {request.enable_query_improvement}, verification: {request.enable_verification_check}")
+
             result = await rag.aquery(
                 query=request.query,
                 mode=request.mode,
-                enable_query_improvement=True,
-                enable_verification=True,
-                return_verification_info=request.return_metadata
+                enable_query_improvement=request.enable_query_improvement,  # Use toggle instead of always true
+                enable_verification=request.enable_verification_check,  # Use toggle instead of always request.enable_verification
+                return_verification_info=request.return_metadata,
+                **query_kwargs
             )
 
             # Augment with web search if requested
@@ -1165,7 +1542,20 @@ async def query_documents(request: QueryRequest):
             conversation_id=conversation_id,
             metadata=metadata if request.return_metadata else None
         )
-        logger.info(f"Query completed successfully (confidence: {confidence:.2f})")
+
+        # Store in cache if enabled (non-web search queries only)
+        if cache_key and request.enable_cache:
+            query_cache[cache_key] = response
+            logger.info(f"✓ Cached query result (key: {cache_key[:16]}...)")
+
+        # Track performance metrics
+        query_time = time.time() - start_time
+        performance_metrics["query_times"].append(query_time)
+        # Keep only last 100 metrics
+        if len(performance_metrics["query_times"]) > 100:
+            performance_metrics["query_times"] = performance_metrics["query_times"][-100:]
+
+        logger.info(f"Query completed in {query_time:.2f}s (fast_mode: {request.fast_mode}, confidence: {confidence:.2f})")
         return response
     except HTTPException:
         raise
@@ -1255,6 +1645,42 @@ async def list_documents(domain: str):
         raise HTTPException(status_code=500, detail=f"Failed to list documents: {str(e)}")
 
 
+@app.get("/performance-metrics")
+async def get_performance_metrics():
+    """Get performance metrics for queries and document processing."""
+    try:
+        query_times = performance_metrics.get("query_times", [])
+        processing_times = performance_metrics.get("processing_times", [])
+
+        # Calculate statistics
+        def calc_stats(times):
+            if not times:
+                return {"count": 0, "avg": 0, "min": 0, "max": 0}
+            return {
+                "count": len(times),
+                "avg": sum(times) / len(times),
+                "min": min(times),
+                "max": max(times)
+            }
+
+        return {
+            "query_metrics": calc_stats(query_times),
+            "processing_metrics": calc_stats(processing_times),
+            "cache_stats": {
+                "size": len(query_cache),
+                "max_size": query_cache.maxsize,
+                "ttl_seconds": query_cache.ttl
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting performance metrics: {e}", exc_info=True)
+        return {
+            "query_metrics": {"count": 0, "avg": 0, "min": 0, "max": 0},
+            "processing_metrics": {"count": 0, "avg": 0, "min": 0, "max": 0},
+            "cache_stats": {"size": 0, "max_size": 100, "ttl_seconds": 300}
+        }
+
+
 @app.get("/status/{processing_id}")
 async def get_processing_status(processing_id: str):
     """Get the processing status of a document."""
@@ -1297,16 +1723,27 @@ async def get_processing_status(processing_id: str):
 
 @app.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
-    """Delete a processed document completely including RAG data (embeddings, chunks, graph)."""
-    try:
-        import shutil
-        deleted = False
-        deleted_from_rag = False
-        found_domain = None
+    """
+    Delete a processed document completely including all RAG data.
 
-        # Search for the document in all domains
+    This endpoint performs comprehensive deletion of:
+    - Knowledge graph entities and relationships
+    - Embedding vectors (chunks, entities, relationships)
+    - Text chunks and metadata
+    - Document status records
+    - Physical upload files
+    - Parser output files
+
+    Returns detailed deletion report with verification.
+    """
+    try:
+        from raganything.deletion_verifier import delete_document_complete
+
+        logger.info(f"Delete document request: {doc_id}")
+
+        # Step 1: Search for the document in all domains
+        found_domain = None
         for domain in DOMAIN_CONFIGS.keys():
-            # Check if file exists in this domain
             domain_upload_dir = UPLOAD_DIR / domain
             if domain_upload_dir.exists():
                 for file_path in domain_upload_dir.glob(f"{doc_id}_*"):
@@ -1317,76 +1754,84 @@ async def delete_document(doc_id: str):
                 break
 
         if not found_domain:
+            logger.warning(f"Document {doc_id} not found in any domain")
             raise HTTPException(status_code=404, detail="Document not found")
 
-        # Delete from RAG system (embeddings, vectors, graph)
-        try:
-            rag = await get_rag_instance(found_domain)
+        logger.info(f"Found document {doc_id} in domain: {found_domain}")
 
-            # Find document in doc_status by processing_id prefix
-            doc_status_file = STORAGE_DIR / found_domain / "kv_store_doc_status.json"
-            if doc_status_file.exists():
-                import json
-                with open(doc_status_file, 'r') as f:
-                    doc_status = json.load(f)
+        # Step 2: Get RAG instance and find the actual document ID in storage
+        rag = await get_rag_instance(found_domain)
 
-                # Find document by file_path containing doc_id
-                doc_to_delete = None
-                for doc_key, doc_info in doc_status.items():
-                    if 'file_path' in doc_info and doc_info['file_path'].startswith(f"{doc_id}_"):
-                        doc_to_delete = doc_key
-                        break
+        # Find document in doc_status by processing_id prefix
+        doc_to_delete = None
+        doc_status_file = STORAGE_DIR / found_domain / "kv_store_doc_status.json"
+        if doc_status_file.exists():
+            import json
+            with open(doc_status_file, 'r') as f:
+                doc_status = json.load(f)
 
-                if doc_to_delete:
-                    logger.info(f"Deleting document from RAG: {doc_to_delete}")
-                    # Use RAG's delete_by_doc_id method to remove document, chunks, entities, and relations
-                    try:
-                        await rag.adelete_by_doc_id(doc_to_delete)
-                        deleted_from_rag = True
-                        logger.info(f"Successfully deleted document {doc_to_delete} from RAG system (embeddings, chunks, graph)")
-                    except Exception as e:
-                        logger.warning(f"Could not delete from RAG (may not exist): {e}")
-                        # Continue with file deletion even if RAG deletion fails
-        except Exception as e:
-            logger.error(f"Error deleting from RAG system: {e}", exc_info=True)
-            # Continue with file deletion even if RAG deletion fails
+            # Find document by file_path containing doc_id
+            for doc_key, doc_info in doc_status.items():
+                if 'file_path' in doc_info and doc_id in doc_info['file_path']:
+                    doc_to_delete = doc_key
+                    logger.info(f"Found document in storage: {doc_key}")
+                    break
 
-        # Delete from upload directory
-        domain_upload_dir = UPLOAD_DIR / found_domain
-        if domain_upload_dir.exists():
-            for file_path in domain_upload_dir.glob(f"{doc_id}_*"):
-                if file_path.is_file():
-                    file_path.unlink()
-                    logger.info(f"Deleted upload file: {file_path}")
-                    deleted = True
+        if not doc_to_delete:
+            logger.warning(f"Document {doc_id} not found in doc_status")
+            # Still try to delete physical files
+            doc_to_delete = doc_id
 
-        # Delete from output directory (processed files)
+        # Step 3: Collect files and directories to delete
+        upload_files = list((UPLOAD_DIR / found_domain).glob(f"{doc_id}_*"))
         output_dir = BASE_DIR / "backend" / "output"
-        if output_dir.exists():
-            for output_path in output_dir.glob(f"{doc_id}_*"):
-                if output_path.is_dir():
-                    shutil.rmtree(output_path)
-                    logger.info(f"Deleted output directory: {output_path}")
-                    deleted = True
-                elif output_path.is_file():
-                    output_path.unlink()
-                    logger.info(f"Deleted output file: {output_path}")
-                    deleted = True
+        output_paths = list(output_dir.glob(f"{doc_id}_*")) if output_dir.exists() else []
 
-        if deleted or deleted_from_rag:
+        # Step 4: Perform complete deletion with verification
+        deletion_report = await delete_document_complete(
+            rag_instance=rag,
+            doc_id=doc_to_delete,
+            storage_dir=STORAGE_DIR / found_domain,
+            upload_files=upload_files,
+            output_dirs=output_paths
+        )
+
+        # Step 5: Return detailed report
+        if deletion_report.success:
+            logger.info(
+                f"Successfully deleted document {doc_id}: "
+                f"{deletion_report.chunks_deleted} chunks, "
+                f"{deletion_report.entities_deleted} entities, "
+                f"{deletion_report.relationships_deleted} relationships, "
+                f"{len(deletion_report.files_deleted)} files, "
+                f"{len(deletion_report.directories_deleted)} directories"
+            )
             return {
                 "success": True,
-                "message": "Document deleted successfully",
-                "deleted_from_storage": deleted,
-                "deleted_from_rag": deleted_from_rag
+                "message": "Document deleted completely with verification",
+                "domain": found_domain,
+                "report": deletion_report.to_dict()
+            }
+        else:
+            logger.error(
+                f"Document deletion completed with errors for {doc_id}: "
+                f"{deletion_report.errors}"
+            )
+            return {
+                "success": False,
+                "message": "Document deletion completed with errors",
+                "domain": found_domain,
+                "report": deletion_report.to_dict()
             }
 
-        raise HTTPException(status_code=404, detail="Document not found")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting document: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to delete document: {str(e)}")
+        logger.error(f"Error deleting document {doc_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete document: {str(e)}"
+        )
 
 
 # =============================================================================

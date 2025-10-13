@@ -3,8 +3,13 @@ Reranking Module for RAG-Anything
 
 Provides reranking functionality using:
 1. Gemini-based LLM reranking (free tier compatible)
-2. Cross-encoder scoring
+2. Cross-encoder style scoring
 3. Relevance-based reordering
+
+Reranking is crucial for RAG systems because:
+- Vector search (embeddings) finds semantically similar text but may miss subtle context
+- LLMs can deeply understand query intent and document relevance
+- Reranking improves answer quality by promoting truly relevant chunks to the top
 
 Author: RAG-Anything Team
 Version: 1.0.0
@@ -12,14 +17,31 @@ Version: 1.0.0
 
 import asyncio
 import logging
+import re
 from typing import List, Dict, Any, Optional, Callable
-import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 
 
 class GeminiReranker:
-    """Reranker using Gemini API for semantic relevance scoring"""
+    """
+    Reranker using Gemini API for semantic relevance scoring
+
+    This reranker takes chunks from vector search and re-scores them
+    based on deep semantic understanding using an LLM.
+
+    Why reranking matters:
+    ---------------------
+    Vector embeddings alone can miss:
+    - Negations ("not effective" vs "effective")
+    - Context dependencies ("aspirin for elderly" vs "aspirin for children")
+    - Query intent ("what causes X" vs "how to prevent X")
+
+    LLM reranking provides:
+    - Contextual understanding of the query
+    - Semantic relevance beyond keyword matching
+    - Better handling of complex queries
+    """
 
     def __init__(
         self,
@@ -33,9 +55,9 @@ class GeminiReranker:
 
         Args:
             llm_func: Optional LLM function to use for reranking
-            model_name: Gemini model to use
+            model_name: Gemini model to use (default: flash for speed)
             batch_size: Number of chunks to process in parallel
-            temperature: Temperature for relevance scoring
+            temperature: Temperature for relevance scoring (low=consistent)
         """
         self.llm_func = llm_func
         self.model_name = model_name
@@ -50,6 +72,12 @@ class GeminiReranker:
     ) -> List[Dict[str, Any]]:
         """
         Rerank chunks based on relevance to query
+
+        Process:
+        1. Take top chunks from vector search (e.g., top 50)
+        2. Score each chunk's relevance using LLM (0-10 scale)
+        3. Re-order by relevance score
+        4. Return top_k most relevant chunks
 
         Args:
             query: Search query
@@ -71,186 +99,206 @@ class GeminiReranker:
         logger.info(f"Reranking {len(chunks)} chunks for query: {query[:50]}...")
 
         try:
-            # Score all chunks
+            # Score all chunks in batches
             scored_chunks = await self._score_chunks_batch(query, chunks)
 
-            # Sort by relevance score (descending)
-            scored_chunks.sort(key=lambda x: x.get('relevance_score', 0.0), reverse=True)
+            # Sort by relevance score (highest first)
+            scored_chunks.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
 
             # Return top_k if specified
             if top_k:
                 scored_chunks = scored_chunks[:top_k]
 
-            logger.info(f"Reranking complete. Top score: {scored_chunks[0].get('relevance_score', 0.0):.3f}")
+            logger.info(
+                f"Reranking complete. Top score: {scored_chunks[0].get('relevance_score', 0):.2f}, "
+                f"Bottom score: {scored_chunks[-1].get('relevance_score', 0):.2f}"
+            )
+
             return scored_chunks
 
         except Exception as e:
             logger.error(f"Error during reranking: {e}", exc_info=True)
-            # Return original chunks on error
-            for chunk in chunks:
-                chunk['relevance_score'] = 0.5  # Neutral score
-            return chunks
+            # Return original order on error
+            return chunks[:top_k] if top_k else chunks
 
     async def _score_chunks_batch(
         self,
         query: str,
         chunks: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Score chunks in batches for efficiency"""
+        """
+        Score chunks in batches for efficiency
+
+        Args:
+            query: Search query
+            chunks: List of chunks to score
+
+        Returns:
+            Chunks with relevance_score added
+        """
+        scored_chunks = []
 
         # Process in batches to avoid rate limits
-        results = []
         for i in range(0, len(chunks), self.batch_size):
             batch = chunks[i:i + self.batch_size]
 
-            # Score batch in parallel
-            tasks = [self._score_single_chunk(query, chunk) for chunk in batch]
-            batch_results = await asyncio.gather(*tasks)
-            results.extend(batch_results)
+            # Score batch concurrently
+            tasks = [self._score_chunk(query, chunk) for chunk in batch]
+            batch_scores = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Small delay between batches to avoid rate limiting
-            if i + self.batch_size < len(chunks):
-                await asyncio.sleep(0.2)
+            # Collect results
+            for chunk, score_result in zip(batch, batch_scores):
+                if isinstance(score_result, Exception):
+                    logger.warning(f"Failed to score chunk: {score_result}")
+                    chunk['relevance_score'] = 0.0
+                else:
+                    chunk['relevance_score'] = score_result
 
-        return results
+                scored_chunks.append(chunk)
 
-    async def _score_single_chunk(
+        return scored_chunks
+
+    async def _score_chunk(
         self,
         query: str,
         chunk: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Score a single chunk for relevance"""
+    ) -> float:
+        """
+        Score a single chunk's relevance to the query using LLM
 
+        Prompt engineering approach:
+        - Ask LLM to act as a relevance judge
+        - Provide clear scoring criteria (0-10 scale)
+        - Extract numeric score from response
+
+        Args:
+            query: Search query
+            chunk: Chunk dictionary with 'content' field
+
+        Returns:
+            Relevance score (0-10)
+        """
         content = chunk.get('content', '')
         if not content:
-            chunk['relevance_score'] = 0.0
-            return chunk
+            return 0.0
 
-        try:
-            # Build scoring prompt
-            prompt = self._build_scoring_prompt(query, content)
+        # Truncate very long chunks to avoid token limits
+        max_content_length = 1000
+        if len(content) > max_content_length:
+            content = content[:max_content_length] + "..."
 
-            # Call LLM for scoring
-            if self.llm_func:
-                response = await self._call_llm_safely(prompt)
-            else:
-                response = await self._call_gemini_directly(prompt)
-
-            # Parse score from response
-            score = self._parse_score(response)
-            chunk['relevance_score'] = score
-
-            return chunk
-
-        except Exception as e:
-            logger.debug(f"Error scoring chunk: {e}")
-            chunk['relevance_score'] = 0.5  # Neutral score on error
-            return chunk
-
-    def _build_scoring_prompt(self, query: str, content: str) -> str:
-        """Build prompt for relevance scoring"""
-
-        # Truncate content if too long
-        max_content_len = 1000
-        if len(content) > max_content_len:
-            content = content[:max_content_len] + "..."
-
-        prompt = f"""Rate the relevance of the following text passage to the given query on a scale of 0.0 to 1.0.
+        # Prompt for relevance scoring
+        prompt = f"""You are a relevance judge. Score how relevant the following passage is to answering the query.
 
 Query: {query}
 
 Passage:
 {content}
 
-Instructions:
-- Consider semantic relevance, not just keyword matching
-- 1.0 = Highly relevant, directly answers the query
-- 0.7-0.9 = Relevant, contains useful information
-- 0.4-0.6 = Somewhat relevant, tangentially related
-- 0.0-0.3 = Not relevant or off-topic
+Scoring criteria:
+10 = Directly answers the query with specific, relevant information
+8-9 = Highly relevant, provides useful context
+6-7 = Somewhat relevant, contains related information
+4-5 = Tangentially related, limited usefulness
+2-3 = Barely related, mostly off-topic
+0-1 = Completely irrelevant
 
-Return ONLY a single number between 0.0 and 1.0, nothing else."""
-
-        return prompt
-
-    async def _call_llm_safely(self, prompt: str) -> str:
-        """Call LLM function safely with error handling"""
+Respond with ONLY a number from 0-10. No explanation needed."""
 
         try:
-            if asyncio.iscoroutinefunction(self.llm_func):
+            # Call LLM for scoring
+            if self.llm_func:
                 response = await self.llm_func(
                     prompt=prompt,
                     temperature=self.temperature,
-                    max_tokens=10
+                    max_tokens=50  # Increased from 10 to allow for complete score responses
                 )
             else:
-                response = self.llm_func(
-                    prompt=prompt,
-                    temperature=self.temperature,
-                    max_tokens=10
-                )
-            return response
+                # Fallback: no reranking
+                return 5.0
+
+            # Extract numeric score from response
+            score = self._extract_score(response)
+            return score
 
         except Exception as e:
-            logger.debug(f"Error calling LLM: {e}")
-            raise
+            logger.error(f"Error scoring chunk: {e}")
+            return 5.0  # Default mid-range score on error
 
-    async def _call_gemini_directly(self, prompt: str) -> str:
-        """Call Gemini API directly as fallback"""
+    def _extract_score(self, response: str) -> float:
+        """
+        Extract numeric score from LLM response
 
+        Handles various response formats:
+        - "8.5"
+        - "Score: 9"
+        - "The relevance is 7/10"
+        - "8"
+
+        Args:
+            response: LLM response text
+
+        Returns:
+            Extracted score (0-10), defaults to 5.0 if parsing fails
+        """
         try:
-            model = genai.GenerativeModel(self.model_name)
-            response = await asyncio.to_thread(
-                model.generate_content,
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=self.temperature,
-                    max_output_tokens=10
-                )
-            )
-            return response.text
+            # Remove whitespace
+            response = response.strip()
 
-        except Exception as e:
-            logger.debug(f"Error calling Gemini directly: {e}")
-            raise
+            # Try to find a number (int or float) in the response
+            # Pattern matches: "8", "8.5", "9/10", "Score: 7", etc.
+            number_pattern = r'(\d+\.?\d*)'
+            matches = re.findall(number_pattern, response)
 
-    def _parse_score(self, response: str) -> float:
-        """Parse relevance score from LLM response"""
+            if matches:
+                # Take the first number found
+                score = float(matches[0])
 
-        try:
-            # Extract first number from response
-            import re
-            numbers = re.findall(r'0?\.\d+|[01]\.?\d*', response)
-            if numbers:
-                score = float(numbers[0])
-                # Clamp to valid range
-                return max(0.0, min(1.0, score))
+                # Normalize to 0-10 range
+                score = max(0.0, min(10.0, score))
+
+                return score
             else:
-                logger.debug(f"Could not parse score from: {response}")
-                return 0.5
+                logger.warning(f"Could not extract score from response: {response}")
+                return 5.0
 
         except Exception as e:
-            logger.debug(f"Error parsing score: {e}")
-            return 0.5
+            logger.error(f"Error extracting score: {e}")
+            return 5.0
 
 
-def create_gemini_reranker(
-    llm_func: Optional[Callable] = None,
-    api_key: Optional[str] = None,
-    **kwargs
-) -> GeminiReranker:
-    """
-    Factory function to create a Gemini reranker
+# Example usage
+async def main():
+    """Example demonstrating reranking"""
+    # Mock LLM function for testing
+    async def mock_llm(prompt: str, **kwargs) -> str:
+        # Simulate scoring based on keyword matching
+        if "directly" in prompt.lower():
+            return "9"
+        elif "somewhat" in prompt.lower():
+            return "6"
+        else:
+            return "3"
 
-    Args:
-        llm_func: Optional LLM function to use
-        api_key: Gemini API key (if calling directly)
-        **kwargs: Additional arguments for GeminiReranker
+    # Create reranker
+    reranker = GeminiReranker(llm_func=mock_llm)
 
-    Returns:
-        Configured GeminiReranker instance
-    """
-    if api_key:
-        genai.configure(api_key=api_key)
+    # Example query and chunks
+    query = "What are the side effects of aspirin?"
 
-    return GeminiReranker(llm_func=llm_func, **kwargs)
+    chunks = [
+        {"content": "Aspirin can cause stomach bleeding in some patients..."},
+        {"content": "The history of aspirin dates back to ancient times..."},
+        {"content": "Common side effects include nausea and heartburn..."},
+    ]
+
+    # Rerank
+    reranked = await reranker.rerank(query, chunks, top_k=2)
+
+    print("Reranked results:")
+    for i, chunk in enumerate(reranked, 1):
+        print(f"{i}. Score: {chunk['relevance_score']:.1f} - {chunk['content'][:50]}...")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
