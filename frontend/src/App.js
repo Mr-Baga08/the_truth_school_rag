@@ -10,6 +10,10 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
+import 'highlight.js/styles/github.css'; // Code syntax highlighting theme
 import {
   Send,
   Upload,
@@ -123,9 +127,24 @@ export default function EnhancedMultiDomainRAG() {
   );
   const [urlInput, setUrlInput] = useState('');
   const [uploadMode, setUploadMode] = useState('file'); // 'file' or 'url'
+  const [fastMode, setFastMode] = useState(() =>
+    getFromLocalStorage('fastMode', false)
+  );
+  const [enableCache, setEnableCache] = useState(() =>
+    getFromLocalStorage('enableCache', true)
+  );
+  const [enableQueryImprovement, setEnableQueryImprovement] = useState(() =>
+    getFromLocalStorage('enableQueryImprovement', true)
+  );
+  const [enableVerification, setEnableVerification] = useState(() =>
+    getFromLocalStorage('enableVerification', true)
+  );
+  const [typingSpeed] = useState(0)
 
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
+  const typingQueueRef = useRef([]);
+  const typingIntervalRef = useRef(null);
 
   // Auto-scroll to bottom of messages
   const scrollToBottom = () => {
@@ -170,6 +189,51 @@ export default function EnhancedMultiDomainRAG() {
       console.error('Error saving webSearchOnly to localStorage:', error);
     }
   }, [webSearchOnly]);
+
+  // Persist fast mode setting to localStorage
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('fastMode', JSON.stringify(fastMode));
+    } catch (error) {
+      console.error('Error saving fastMode to localStorage:', error);
+    }
+  }, [fastMode]);
+
+  // Persist cache setting to localStorage
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('enableCache', JSON.stringify(enableCache));
+    } catch (error) {
+      console.error('Error saving enableCache to localStorage:', error);
+    }
+  }, [enableCache]);
+
+  // Persist query improvement setting to localStorage
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('enableQueryImprovement', JSON.stringify(enableQueryImprovement));
+    } catch (error) {
+      console.error('Error saving enableQueryImprovement to localStorage:', error);
+    }
+  }, [enableQueryImprovement]);
+
+  // Persist verification setting to localStorage
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('enableVerification', JSON.stringify(enableVerification));
+    } catch (error) {
+      console.error('Error saving enableVerification to localStorage:', error);
+    }
+  }, [enableVerification]);
+
+  // Persist typing speed setting to localStorage
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('typingSpeed', JSON.stringify(typingSpeed));
+    } catch (error) {
+      console.error('Error saving typingSpeed to localStorage:', error);
+    }
+  }, [typingSpeed]);
 
   // Fetch processed documents function with useCallback
   const fetchProcessedDocuments = useCallback(async () => {
@@ -332,6 +396,51 @@ export default function EnhancedMultiDomainRAG() {
     }
   };
 
+  // Typing effect function with queue-based approach
+  const startTypingEffect = useCallback((messageIndex, targetTextRef, isStreamingRef) => {
+    // Clear any existing typing interval
+    if (typingIntervalRef.current) {
+      clearInterval(typingIntervalRef.current);
+    }
+
+    let displayedLength = 0;
+
+    typingIntervalRef.current = setInterval(() => {
+      const targetText = targetTextRef.current || '';
+      const isStillStreaming = isStreamingRef.current;
+
+      if (displayedLength < targetText.length) {
+        // Add characters based on typing speed (higher = faster)
+        const charsToAdd = Math.max(1, Math.floor(typingSpeed / 10));
+        displayedLength = Math.min(displayedLength + charsToAdd, targetText.length);
+
+        setMessages(prev => {
+          const newMessages = [...prev];
+          if (newMessages[messageIndex]) {
+            newMessages[messageIndex] = {
+              ...newMessages[messageIndex],
+              content: targetText.substring(0, displayedLength)
+            };
+          }
+          return newMessages;
+        });
+      } else if (!isStillStreaming && displayedLength >= targetText.length) {
+        // If we've caught up and streaming is done, clear the interval
+        clearInterval(typingIntervalRef.current);
+        typingIntervalRef.current = null;
+      }
+    }, 30); // Update every 30ms for smoother animation
+  }, [typingSpeed]);
+
+  // Cleanup typing interval on unmount
+  useEffect(() => {
+    return () => {
+      if (typingIntervalRef.current) {
+        clearInterval(typingIntervalRef.current);
+      }
+    };
+  }, []);
+
   const handleQuery = async () => {
     if (!query.trim()) return;
 
@@ -340,37 +449,190 @@ export default function EnhancedMultiDomainRAG() {
 
     const userMessage = { role: 'user', content: query };
     setMessages(prev => [...prev, userMessage]);
+    const currentQuery = query;
+    setQuery('');
+
+    // Create placeholder for streaming response
+    const assistantMessageIndex = messages.length + 1;
+    setMessages(prev => [...prev, {
+      role: 'assistant',
+      content: '',
+      streaming: true,
+      verification: null
+    }]);
+
+    // Use ref to store the full text buffer so typing effect can access it
+    const fullTextBufferRef = { current: '' };
+    const isStreamingRef = { current: true };
+    let typingStarted = false;
 
     try {
-      const response = await fetch(`${API_BASE_URL}/query`, {
+      const response = await fetch(`${API_BASE_URL}/query/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          query: query,
+          query: currentQuery,
           domain: selectedDomain,
-          conversation_history: messages.slice(-10),
+          enable_verification: true,
           enable_web_search: enableWebSearch,
-          web_search_only: webSearchOnly
+          web_search_only: webSearchOnly,
+          fast_mode: fastMode,
+          enable_cache: enableCache,
+          enable_query_improvement: enableQueryImprovement,
+          enable_verification_check: enableVerification
         })
       });
 
-      const data = await response.json();
-
-      if (response.ok) {
-        const assistantMessage = {
-          role: 'assistant',
-          content: data.answer,
-          sources: data.sources,
-          confidence: data.confidence
-        };
-        setMessages(prev => [...prev, assistantMessage]);
-        setQuery('');
-      } else {
-        setError(data.detail || 'Query failed');
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
+
+      // Read the stream
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) {
+          break;
+        }
+
+        // Decode chunk
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete SSE events
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || ''; // Keep incomplete event in buffer
+
+        for (const event of events) {
+          if (!event.trim()) continue;
+
+          const lines = event.split('\n');
+          let eventType = 'message';
+          let eventData = '';
+
+          for (const line of lines) {
+            if (line.startsWith('event:')) {
+              eventType = line.substring(6).trim();
+            } else if (line.startsWith('data:')) {
+              eventData = line.substring(5).trim();
+            }
+          }
+
+          if (eventData) {
+            const data = JSON.parse(eventData);
+
+            if (eventType === 'token') {
+              // Add to buffer ref
+              fullTextBufferRef.current += data.content;
+
+              // Start typing effect once if speed > 0
+              if (!typingStarted && typingSpeed > 0) {
+                typingStarted = true;
+                startTypingEffect(assistantMessageIndex, fullTextBufferRef, isStreamingRef);
+              } else if (typingSpeed === 0) {
+                // Instant display if typing speed is 0
+                setMessages(prev => {
+                  const newMessages = [...prev];
+                  newMessages[assistantMessageIndex] = {
+                    ...newMessages[assistantMessageIndex],
+                    content: fullTextBufferRef.current
+                  };
+                  return newMessages;
+                });
+              }
+
+            } else if (eventType === 'verification') {
+              // Add verification info to message
+              setMessages(prev => {
+                const newMessages = [...prev];
+                newMessages[assistantMessageIndex] = {
+                  ...newMessages[assistantMessageIndex],
+                  verification: data.content,
+                  streaming: false
+                };
+                return newMessages;
+              });
+
+            } else if (eventType === 'done') {
+              // Mark streaming as complete
+              isStreamingRef.current = false;
+
+              // Wait a bit for typing to catch up, then ensure final text is shown
+              setTimeout(() => {
+                if (typingIntervalRef.current) {
+                  clearInterval(typingIntervalRef.current);
+                  typingIntervalRef.current = null;
+                }
+
+                // Set final content and mark as complete
+                setMessages(prev => {
+                  const newMessages = [...prev];
+                  newMessages[assistantMessageIndex] = {
+                    ...newMessages[assistantMessageIndex],
+                    streaming: false,
+                    content: fullTextBufferRef.current
+                  };
+                  return newMessages;
+                });
+              }, typingSpeed === 0 ? 0 : 500); // Wait 500ms for typing to finish
+
+            } else if (eventType === 'error') {
+              const errorMessage = data.content.message || 'An error occurred while processing your query';
+              const errorSuggestion = data.content.suggestion || '';
+              setError(errorSuggestion ? `${errorMessage}\n\n${errorSuggestion}` : errorMessage);
+
+              // Mark streaming as complete
+              isStreamingRef.current = false;
+
+              // Clear typing interval
+              if (typingIntervalRef.current) {
+                clearInterval(typingIntervalRef.current);
+                typingIntervalRef.current = null;
+              }
+
+              // Mark message as error with helpful message
+              setMessages(prev => {
+                const newMessages = [...prev];
+                newMessages[assistantMessageIndex] = {
+                  ...newMessages[assistantMessageIndex],
+                  content: fullTextBufferRef.current || errorMessage,
+                  streaming: false,
+                  error: true
+                };
+                return newMessages;
+              });
+              break;
+            }
+          }
+        }
+      }
+
     } catch (err) {
       console.error('Query error:', err);
       setError(`Query failed: ${err.message}`);
+
+      // Clear typing interval
+      if (typingIntervalRef.current) {
+        clearInterval(typingIntervalRef.current);
+        typingIntervalRef.current = null;
+      }
+
+      // Update message with error
+      setMessages(prev => {
+        const newMessages = [...prev];
+        if (newMessages[assistantMessageIndex]) {
+          newMessages[assistantMessageIndex] = {
+            ...newMessages[assistantMessageIndex],
+            content: newMessages[assistantMessageIndex].content || '[Error occurred]',
+            streaming: false,
+            error: true
+          };
+        }
+        return newMessages;
+      });
     } finally {
       setIsQuerying(false);
     }
@@ -383,10 +645,25 @@ export default function EnhancedMultiDomainRAG() {
     }
   };
 
-  const handleDeleteDocument = async (docId) => {
+  const handleDeleteDocument = async (docId, docName) => {
     if (!docId) {
       console.error('Document ID is undefined');
       setError('Cannot delete document: ID is missing');
+      return;
+    }
+
+    // Show confirmation dialog
+    const confirmed = window.confirm(
+      `Are you sure you want to delete "${docName || 'this document'}"?\n\n` +
+      `This will permanently remove:\n` +
+      `• All text chunks and embeddings\n` +
+      `• Knowledge graph entities and relationships\n` +
+      `• Vector database entries\n` +
+      `• Physical files\n\n` +
+      `This action cannot be undone.`
+    );
+
+    if (!confirmed) {
       return;
     }
 
@@ -395,17 +672,40 @@ export default function EnhancedMultiDomainRAG() {
         method: 'DELETE'
       });
 
-      if (response.ok) {
+      const data = await response.json();
+
+      if (response.ok && data.success) {
+        // Show success message with deletion details
+        const report = data.report;
+        const summary = report?.summary || {};
+
+        alert(
+          `✓ Document deleted successfully!\n\n` +
+          `Removed from knowledge base:\n` +
+          `• ${summary.chunks_deleted || 0} text chunks\n` +
+          `• ${summary.entities_deleted || 0} knowledge graph entities\n` +
+          `• ${summary.relationships_deleted || 0} relationships\n` +
+          `• ${summary.vectors_deleted || 0} embedding vectors\n` +
+          `• ${summary.files_deleted || 0} physical files\n` +
+          `• ${summary.directories_deleted || 0} directories`
+        );
+
         setProcessedDocs(prev => prev.filter(doc => doc.id !== docId));
         // Also refresh the documents list to ensure consistency
         await fetchProcessedDocuments();
       } else {
-        const data = await response.json();
-        setError(data.detail || 'Failed to delete document');
+        // Show error with details if available
+        const errorMsg = data.message || data.detail || 'Failed to delete document';
+        const errors = data.report?.errors || [];
+
+        setError(
+          errorMsg +
+          (errors.length > 0 ? `\n\nErrors: ${errors.join(', ')}` : '')
+        );
       }
     } catch (err) {
       console.error('Error deleting document:', err);
-      setError('Failed to delete document');
+      setError('Failed to delete document: ' + err.message);
     }
   };
 
@@ -541,7 +841,7 @@ export default function EnhancedMultiDomainRAG() {
                   <FileText className="w-4 h-4 text-gray-400" />
                   <span className="text-xs text-gray-700 truncate flex-1">{doc.name || `Document ${idx + 1}`}</span>
                   <button
-                    onClick={() => handleDeleteDocument(doc.id)}
+                    onClick={() => handleDeleteDocument(doc.id, doc.name)}
                     className="opacity-0 group-hover:opacity-100 transition-opacity"
                   >
                     <Trash2 className="w-3 h-3 text-gray-400 hover:text-red-600" />
@@ -610,9 +910,111 @@ export default function EnhancedMultiDomainRAG() {
             {messages.map((msg, idx) => (
               <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div className={`max-w-2xl ${msg.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-800'} rounded-2xl px-4 py-3`}>
-                  <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+                  <div className="flex items-start space-x-2">
+                    <div className="flex-1">
+                      {msg.role === 'user' ? (
+                        // User messages: simple text
+                        <p className="text-sm whitespace-pre-wrap">
+                          {msg.content}
+                        </p>
+                      ) : (
+                        // Assistant messages: rendered markdown
+                        <div className="text-sm prose prose-sm max-w-none prose-headings:mt-3 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-pre:my-2 prose-pre:bg-gray-800 prose-pre:text-gray-100">
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            rehypePlugins={[rehypeHighlight]}
+                            components={{
+                              // Custom styling for code blocks
+                              code({ node, inline, className, children, ...props }) {
+                                return inline ? (
+                                  <code className="bg-gray-200 text-gray-800 px-1.5 py-0.5 rounded text-xs font-mono" {...props}>
+                                    {children}
+                                  </code>
+                                ) : (
+                                  <code className={className} {...props}>
+                                    {children}
+                                  </code>
+                                );
+                              },
+                              // Custom styling for links
+                              a({ node, children, ...props }) {
+                                return (
+                                  <a className="text-blue-600 hover:text-blue-800 underline" target="_blank" rel="noopener noreferrer" {...props}>
+                                    {children}
+                                  </a>
+                                );
+                              },
+                              // Custom styling for headings
+                              h1: ({ node, ...props }) => <h1 className="text-xl font-bold text-gray-900 mt-4 mb-2" {...props} />,
+                              h2: ({ node, ...props }) => <h2 className="text-lg font-bold text-gray-900 mt-3 mb-2" {...props} />,
+                              h3: ({ node, ...props }) => <h3 className="text-base font-semibold text-gray-900 mt-2 mb-1" {...props} />,
+                              // Custom styling for lists
+                              ul: ({ node, ...props }) => <ul className="list-disc list-inside space-y-1 my-2" {...props} />,
+                              ol: ({ node, ...props }) => <ol className="list-decimal list-inside space-y-1 my-2" {...props} />,
+                              // Custom styling for blockquotes
+                              blockquote: ({ node, ...props }) => (
+                                <blockquote className="border-l-4 border-gray-300 pl-4 italic text-gray-700 my-2" {...props} />
+                              ),
+                              // Custom styling for tables
+                              table: ({ node, ...props }) => (
+                                <div className="overflow-x-auto my-2">
+                                  <table className="min-w-full divide-y divide-gray-200 border border-gray-200" {...props} />
+                                </div>
+                              ),
+                              th: ({ node, ...props }) => (
+                                <th className="px-3 py-2 bg-gray-50 text-left text-xs font-semibold text-gray-700 uppercase tracking-wider border-b" {...props} />
+                              ),
+                              td: ({ node, ...props }) => (
+                                <td className="px-3 py-2 text-sm text-gray-900 border-b" {...props} />
+                              ),
+                            }}
+                          >
+                            {msg.content}
+                          </ReactMarkdown>
+                          {msg.streaming && (
+                            <span className="inline-block w-0.5 h-4 bg-blue-600 ml-1 animate-pulse"></span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    {msg.streaming && msg.role === 'assistant' && (
+                      <Loader2 className="w-4 h-4 text-gray-400 animate-spin flex-shrink-0 mt-0.5" />
+                    )}
+                  </div>
+
+                  {/* Verification Badge
+                  {msg.verification && !msg.streaming && (
+                    <div className={`mt-3 pt-3 border-t ${msg.role === 'user' ? 'border-blue-500' : 'border-gray-300'}`}>
+                      <div className="flex items-center space-x-2 mb-2">
+                        {msg.verification.passed ? (
+                          <CheckCircle className="w-4 h-4 text-green-600" />
+                        ) : (
+                          <XCircle className="w-4 h-4 text-red-600" />
+                        )}
+                        <span className={`text-xs font-medium ${
+                          msg.verification.passed ? 'text-green-700' : 'text-red-700'
+                        }`}>
+                          Verification Score: {msg.verification.score?.toFixed(1)}/10
+                        </span>
+                        <span className="text-xs text-gray-500">
+                          ({Math.round((msg.verification.confidence || 0) * 100)}% confident)
+                        </span>
+                      </div>
+                      {msg.verification.issues && msg.verification.issues.length > 0 && (
+                        <div className="mt-2">
+                          <p className="text-xs text-gray-600 font-medium mb-1">Issues found:</p>
+                          <ul className="text-xs text-gray-600 space-y-0.5 list-disc list-inside">
+                            {msg.verification.issues.slice(0, 3).map((issue, i) => (
+                              <li key={i}>{issue}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )} */}
+
                   {msg.sources && msg.sources.length > 0 && (
-                    <div className="mt-3 pt-3 border-t border-gray-200">
+                    <div className={`mt-3 pt-3 border-t ${msg.role === 'user' ? 'border-blue-500' : 'border-gray-300'}`}>
                       <p className="text-xs text-gray-600 mb-2">Sources:</p>
                       {msg.sources.slice(0, 3).map((source, i) => (
                         <div key={i} className="text-xs text-gray-600 mb-1">
@@ -624,13 +1026,6 @@ export default function EnhancedMultiDomainRAG() {
                 </div>
               </div>
             ))}
-            {isQuerying && (
-              <div className="flex justify-start">
-                <div className="bg-gray-100 rounded-2xl px-4 py-3">
-                  <Loader2 className="w-5 h-5 text-gray-600 animate-spin" />
-                </div>
-              </div>
-            )}
             <div ref={messagesEndRef} />
           </div>
         </div>
@@ -772,13 +1167,13 @@ export default function EnhancedMultiDomainRAG() {
                   <div className="flex items-start justify-between mb-3">
                     <FileText className="w-8 h-8 text-blue-600" />
                     <button
-                      onClick={() => handleDeleteDocument(doc.id)}
+                      onClick={() => handleDeleteDocument(doc.id, doc.name)}
                       className="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-gray-100 rounded"
                     >
                       <Trash2 className="w-4 h-4 text-gray-400 hover:text-red-600" />
                     </button>
                   </div>
-                  <p className="font-medium text-gray-800 mb-1 truncate">{doc.name || `Document ${idx + 1}`}</p>
+                  <p className="font-medium text-gray-800 mb-1 truncate" title={doc.name}>{doc.name || `Document ${idx + 1}`}</p>
                   <p className="text-sm text-gray-600 mb-2">{DOMAIN_CONFIGS[doc.domain]?.name || selectedDomain}</p>
                   <div className="flex items-center space-x-2">
                     <CheckCircle className="w-4 h-4 text-green-600" />
@@ -824,6 +1219,131 @@ export default function EnhancedMultiDomainRAG() {
                   ))}
                 </div>
               </div>
+            </div>
+          </div>
+
+          <div className="bg-white border border-gray-200 rounded-lg p-6">
+            <h3 className="text-lg font-semibold text-gray-800 mb-4">Performance Settings</h3>
+            <div className="space-y-4">
+              <div className="flex items-start space-x-3">
+                <input
+                  type="checkbox"
+                  id="fastMode"
+                  checked={fastMode}
+                  onChange={(e) => setFastMode(e.target.checked)}
+                  className="w-5 h-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500 mt-0.5"
+                />
+                <div className="flex-1">
+                  <label htmlFor="fastMode" className="block text-sm font-medium text-gray-700 cursor-pointer">
+                    Fast Mode
+                  </label>
+                  <p className="text-xs text-gray-600 mt-1">
+                    Use optimized parameters for 2-3x faster queries. Slightly reduced quality but much better performance.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-start space-x-3">
+                <input
+                  type="checkbox"
+                  id="enableCache"
+                  checked={enableCache}
+                  onChange={(e) => setEnableCache(e.target.checked)}
+                  className="w-5 h-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500 mt-0.5"
+                />
+                <div className="flex-1">
+                  <label htmlFor="enableCache" className="block text-sm font-medium text-gray-700 cursor-pointer">
+                    Enable Query Caching
+                  </label>
+                  <p className="text-xs text-gray-600 mt-1">
+                    Cache query results for 5 minutes. Repeated queries return instantly (100x faster).
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-start space-x-3">
+                <input
+                  type="checkbox"
+                  id="enableWebSearch"
+                  checked={enableWebSearch}
+                  onChange={(e) => {
+                    setEnableWebSearch(e.target.checked);
+                    if (e.target.checked && webSearchOnly) {
+                      setWebSearchOnly(false);
+                    }
+                  }}
+                  className="w-5 h-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500 mt-0.5"
+                />
+                <div className="flex-1">
+                  <label htmlFor="enableWebSearch" className="block text-sm font-medium text-gray-700 cursor-pointer">
+                    Enhance with Web Search
+                  </label>
+                  <p className="text-xs text-gray-600 mt-1">
+                    Augment document answers with current web search results.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-start space-x-3">
+                <input
+                  type="checkbox"
+                  id="webSearchOnly"
+                  checked={webSearchOnly}
+                  onChange={(e) => {
+                    setWebSearchOnly(e.target.checked);
+                    if (e.target.checked) {
+                      setEnableWebSearch(false);
+                    }
+                  }}
+                  className="w-5 h-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500 mt-0.5"
+                />
+                <div className="flex-1">
+                  <label htmlFor="webSearchOnly" className="block text-sm font-medium text-gray-700 cursor-pointer">
+                    Web Search Only
+                  </label>
+                  <p className="text-xs text-gray-600 mt-1">
+                    Skip document retrieval and use only web search (useful when no documents uploaded).
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-start space-x-3">
+                <input
+                  type="checkbox"
+                  id="enableQueryImprovement"
+                  checked={enableQueryImprovement}
+                  onChange={(e) => setEnableQueryImprovement(e.target.checked)}
+                  className="w-5 h-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500 mt-0.5"
+                />
+                <div className="flex-1">
+                  <label htmlFor="enableQueryImprovement" className="block text-sm font-medium text-gray-700 cursor-pointer">
+                    Enable Query Improvement
+                  </label>
+                  <p className="text-xs text-gray-600 mt-1">
+                    Automatically improve and expand user queries for better results. Disable for faster responses.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-start space-x-3">
+                <input
+                  type="checkbox"
+                  id="enableVerification"
+                  checked={enableVerification}
+                  onChange={(e) => setEnableVerification(e.target.checked)}
+                  className="w-5 h-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500 mt-0.5"
+                />
+                <div className="flex-1">
+                  <label htmlFor="enableVerification" className="block text-sm font-medium text-gray-700 cursor-pointer">
+                    Enable Answer Verification
+                  </label>
+                  <p className="text-xs text-gray-600 mt-1">
+                    Use dual-LLM verification to check answer quality and accuracy. Disable for faster responses.
+                  </p>
+                </div>
+              </div>
+
+    
             </div>
           </div>
 

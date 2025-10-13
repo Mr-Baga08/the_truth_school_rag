@@ -867,6 +867,7 @@ plus query improvement and dual-LLM verification capabilities.
 import json
 import hashlib
 import re
+import asyncio
 from typing import Dict, List, Any
 from pathlib import Path
 from lightrag import QueryParam
@@ -881,16 +882,18 @@ from raganything.utils import (
 # Import new enhancement modules
 from raganything.query_improvement import QueryImprovementMixin
 from raganything.verification import DualLLMVerificationMixin
+from raganything.streaming import StreamingQueryMixin
 
 
-class QueryMixin(QueryImprovementMixin, DualLLMVerificationMixin):
+class QueryMixin(QueryImprovementMixin, DualLLMVerificationMixin, StreamingQueryMixin):
     """
     QueryMixin class containing query functionality for RAGAnything
-    
+
     Enhanced with:
     - Query improvement (rewriting, expansion, decomposition)
     - Dual-LLM verification system
     - Answer modification based on feedback
+    - Real-time streaming with verification support
     """
 
     def _generate_multimodal_cache_key(
@@ -1287,7 +1290,7 @@ class QueryMixin(QueryImprovementMixin, DualLLMVerificationMixin):
         self.logger.info(f"Retrieved raw prompt: {str(raw_prompt)[:200]}...")
 
         if raw_prompt is None:
-            self.logger.warning("raw_prompt is None, falling back to normal query")
+            self.logger.warning("raw_prompt is None, falling back to normal query (single pass)")
             query_param = QueryParam(mode=mode, **kwargs)
             return await self.lightrag.aquery(query, param=query_param)
 
@@ -1299,10 +1302,36 @@ class QueryMixin(QueryImprovementMixin, DualLLMVerificationMixin):
         )
 
         if not images_found:
-            self.logger.info("No valid images found, falling back to normal query")
-            # Fallback to normal query
-            query_param = QueryParam(mode=mode, **kwargs)
-            return await self.lightrag.aquery(query, param=query_param)
+            self.logger.info("No valid images found, falling back to normal query WITHOUT re-retrieval")
+            # OPTIMIZATION: Reuse the already-retrieved context instead of querying again
+            # The raw_prompt already contains the full RAG context, so we can use it directly
+
+            # Try to use the existing model function if available
+            if hasattr(self.lightrag, 'llm_model_func') and self.lightrag.llm_model_func:
+                try:
+                    # Generate answer using the already-retrieved context
+                    self.logger.info("Generating answer from cached context (avoiding re-query)")
+
+                    # Call the LLM with the raw prompt directly
+                    if asyncio.iscoroutinefunction(self.lightrag.llm_model_func):
+                        result = await self.lightrag.llm_model_func(raw_prompt)
+                    else:
+                        result = self.lightrag.llm_model_func(raw_prompt)
+
+                    self.logger.info("Successfully generated answer from cached context (no re-query)")
+                    return result
+
+                except Exception as e:
+                    self.logger.warning(f"Failed to use cached context, falling back to re-query: {e}")
+                    # Fall back to re-query if direct generation fails
+                    query_param = QueryParam(mode=mode, **kwargs)
+                    return await self.lightrag.aquery(query, param=query_param)
+            else:
+                # No model_func available, must re-query (original behavior)
+                # This maintains backward compatibility
+                self.logger.debug("llm_model_func not available, using standard re-query")
+                query_param = QueryParam(mode=mode, **kwargs)
+                return await self.lightrag.aquery(query, param=query_param)
 
         self.logger.info(f"Processed {images_found} images for VLM")
 
