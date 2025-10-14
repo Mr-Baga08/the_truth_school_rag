@@ -1378,8 +1378,9 @@ async def query_documents_stream(request: QueryRequest):
 
     This endpoint provides Server-Sent Events (SSE) streaming for real-time
     response generation while maintaining dual-LLM verification.
+    Supports web search augmentation when enabled.
     """
-    logger.info(f"Streaming query request: '{request.query[:50]}...' in domain: {request.domain}")
+    logger.info(f"Streaming query request: '{request.query[:50]}...' in domain: {request.domain}, web_search: {request.enable_web_search}, web_only: {request.web_search_only}")
 
     async def generate_sse():
         """Generate Server-Sent Events stream"""
@@ -1387,6 +1388,44 @@ async def query_documents_stream(request: QueryRequest):
 
         try:
             conversation_id = request.conversation_id or f"conv_{uuid.uuid4()}"
+
+            # Handle web search only mode
+            if request.web_search_only:
+                if not web_searcher:
+                    error_data = {"type": "error", "content": {"message": "Web search not available. Set TAVILY_API_KEY."}, "done": True}
+                    yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
+                    return
+
+                logger.info("Using web search only mode (streaming)")
+                try:
+                    web_results = await web_searcher.search(request.query, max_results=5)
+                    web_context = web_searcher.format_results_for_llm(web_results)
+
+                    # Synthesize answer using Gemini (streaming simulation)
+                    logger.info("Synthesizing web search results with Gemini (streaming)")
+                    answer = await synthesize_web_results_with_gemini(
+                        query=request.query,
+                        web_context=web_context,
+                        rag_context=None
+                    )
+
+                    # Stream the answer word by word
+                    words = answer.split()
+                    for i, word in enumerate(words):
+                        token = word + " " if i < len(words) - 1 else word
+                        data = {"type": "token", "content": token, "done": False}
+                        yield f"event: token\ndata: {json.dumps(data)}\n\n"
+                        await asyncio.sleep(0.01)  # Small delay for streaming effect
+
+                    # Send completion event
+                    yield f"event: done\ndata: {json.dumps({'message': 'Stream complete', 'conversation_id': conversation_id})}\n\n"
+                    return
+
+                except Exception as e:
+                    logger.error(f"Web search only error: {e}", exc_info=True)
+                    error_data = {"type": "error", "content": {"message": f"Web search failed: {str(e)}"}, "done": True}
+                    yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
+                    return
 
             # Get RAG instance
             rag = await get_rag_instance(request.domain)
@@ -1409,42 +1448,120 @@ async def query_documents_stream(request: QueryRequest):
                 max_total_tokens = 30000
 
             # Log toggle settings
-            logger.info(f"Query settings - improvement: {request.enable_query_improvement}, verification: {request.enable_verification_check}")
+            logger.info(f"Query settings - improvement: {request.enable_query_improvement}, verification: {request.enable_verification_check}, web_search: {request.enable_web_search}")
 
-            # Stream the query with optimized parameters and user-controlled toggles
-            async for chunk in rag.aquery_stream(
-                query=request.query,
-                mode=request.mode,
-                enable_verification=request.enable_verification_check,  # Use toggle instead of always true
-                enable_query_improvement=request.enable_query_improvement,  # Use toggle instead of always true
-                top_k=top_k,
-                chunk_top_k=chunk_top_k,
-                max_entity_tokens=max_entity_tokens,
-                max_relation_tokens=max_relation_tokens,
-                max_total_tokens=max_total_tokens
-            ):
-                chunk_type = chunk.get("type", "token")
-                content = chunk.get("content", "")
-                done = chunk.get("done", False)
+            # If web search augmentation is enabled, we need to collect the RAG answer first
+            # then augment with web search
+            if request.enable_web_search and web_searcher:
+                logger.info("Web search augmentation enabled for streaming")
 
-                if chunk_type == "token":
-                    # Stream token
-                    data = {"type": "token", "content": content, "done": done}
-                    yield f"event: token\ndata: {json.dumps(data)}\n\n"
+                # Collect RAG answer first
+                rag_answer_buffer = []
+                async for chunk in rag.aquery_stream(
+                    query=request.query,
+                    mode=request.mode,
+                    enable_verification=request.enable_verification_check,
+                    enable_query_improvement=request.enable_query_improvement,
+                    top_k=top_k,
+                    chunk_top_k=chunk_top_k,
+                    max_entity_tokens=max_entity_tokens,
+                    max_relation_tokens=max_relation_tokens,
+                    max_total_tokens=max_total_tokens
+                ):
+                    chunk_type = chunk.get("type", "token")
+                    content = chunk.get("content", "")
+                    done = chunk.get("done", False)
 
-                elif chunk_type == "verification":
-                    # Send verification metadata
-                    data = {"type": "verification", "content": content, "done": done}
-                    yield f"event: verification\ndata: {json.dumps(data)}\n\n"
+                    if chunk_type == "token":
+                        # Stream token and collect it
+                        rag_answer_buffer.append(content)
+                        data = {"type": "token", "content": content, "done": False}
+                        yield f"event: token\ndata: {json.dumps(data)}\n\n"
 
-                elif chunk_type == "error":
-                    # Send error
-                    data = {"type": "error", "content": content, "done": True}
-                    yield f"event: error\ndata: {json.dumps(data)}\n\n"
-                    break
+                    elif chunk_type == "verification":
+                        # Send verification metadata
+                        data = {"type": "verification", "content": content, "done": done}
+                        yield f"event: verification\ndata: {json.dumps(data)}\n\n"
 
-            # Send completion event
-            yield f"event: done\ndata: {json.dumps({'message': 'Stream complete', 'conversation_id': conversation_id})}\n\n"
+                    elif chunk_type == "error":
+                        # Send error
+                        data = {"type": "error", "content": content, "done": True}
+                        yield f"event: error\ndata: {json.dumps(data)}\n\n"
+                        return
+
+                # Now perform web search and synthesis
+                try:
+                    rag_answer = "".join(rag_answer_buffer)
+                    logger.info("Performing web search to augment RAG answer...")
+                    web_results = await web_searcher.search(request.query, max_results=5)
+
+                    if web_results.get("results"):
+                        web_context = web_searcher.format_results_for_llm(web_results)
+
+                        # Synthesize combined answer
+                        logger.info("Synthesizing RAG + web results with Gemini")
+                        synthesized_answer = await synthesize_web_results_with_gemini(
+                            query=request.query,
+                            web_context=web_context,
+                            rag_context=rag_answer
+                        )
+
+                        # Clear the previous RAG answer and stream the synthesized one
+                        # Send a newline separator
+                        data = {"type": "token", "content": "\n\n---\n\n**Enhanced with Web Search:**\n\n", "done": False}
+                        yield f"event: token\ndata: {json.dumps(data)}\n\n"
+
+                        # Stream synthesized answer
+                        words = synthesized_answer.split()
+                        for i, word in enumerate(words):
+                            token = word + " " if i < len(words) - 1 else word
+                            data = {"type": "token", "content": token, "done": False}
+                            yield f"event: token\ndata: {json.dumps(data)}\n\n"
+                            await asyncio.sleep(0.01)
+
+                except Exception as e:
+                    logger.error(f"Web search augmentation error: {e}", exc_info=True)
+                    # Continue without web augmentation
+                    pass
+
+                # Send completion event
+                yield f"event: done\ndata: {json.dumps({'message': 'Stream complete', 'conversation_id': conversation_id})}\n\n"
+
+            else:
+                # Standard RAG streaming without web search
+                async for chunk in rag.aquery_stream(
+                    query=request.query,
+                    mode=request.mode,
+                    enable_verification=request.enable_verification_check,
+                    enable_query_improvement=request.enable_query_improvement,
+                    top_k=top_k,
+                    chunk_top_k=chunk_top_k,
+                    max_entity_tokens=max_entity_tokens,
+                    max_relation_tokens=max_relation_tokens,
+                    max_total_tokens=max_total_tokens
+                ):
+                    chunk_type = chunk.get("type", "token")
+                    content = chunk.get("content", "")
+                    done = chunk.get("done", False)
+
+                    if chunk_type == "token":
+                        # Stream token
+                        data = {"type": "token", "content": content, "done": done}
+                        yield f"event: token\ndata: {json.dumps(data)}\n\n"
+
+                    elif chunk_type == "verification":
+                        # Send verification metadata
+                        data = {"type": "verification", "content": content, "done": done}
+                        yield f"event: verification\ndata: {json.dumps(data)}\n\n"
+
+                    elif chunk_type == "error":
+                        # Send error
+                        data = {"type": "error", "content": content, "done": True}
+                        yield f"event: error\ndata: {json.dumps(data)}\n\n"
+                        break
+
+                # Send completion event
+                yield f"event: done\ndata: {json.dumps({'message': 'Stream complete', 'conversation_id': conversation_id})}\n\n"
 
         except Exception as e:
             logger.error(f"Streaming error: {e}", exc_info=True)
