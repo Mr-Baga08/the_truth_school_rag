@@ -753,10 +753,12 @@ export default function EnhancedMultiDomainRAG() {
       <div className="flex items-center justify-between max-w-7xl mx-auto">
         <div className="flex items-center space-x-8">
           <div className="flex items-center space-x-3">
-            <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
-              <span className="text-white font-bold text-sm">O</span>
-            </div>
-            <h1 className="text-xl font-semibold text-gray-800">OrgAI</h1>
+              <div className="flex items-center space-x-2">
+             <div className="h-8 flex items-center justify-center">
+                <img src="/logo.jpg" alt="GlokalAI Logo" className="h-full w-auto" />
+             </div>
+             <h1 className="text-xl font-bold text-gray-800">OrgAI</h1>
+          </div>
             <span className="text-sm text-gray-500">/ {DOMAIN_CONFIGS[selectedDomain].name}</span>
           </div>
 
@@ -888,10 +890,18 @@ export default function EnhancedMultiDomainRAG() {
       {messages.length === 0 ? (
         <div className="flex-1 flex flex-col items-center justify-center px-4">
           <div className="text-center max-w-2xl">
-            <div className="w-16 h-16 bg-gradient-to-br from-blue-500 to-purple-600 rounded-2xl flex items-center justify-center mx-auto mb-6">
+            {/* <div className="w-16 h-16 bg-gradient-to-br from-blue-500 to-purple-600 rounded-2xl flex items-center justify-center mx-auto mb-6">
               <span className="text-white font-bold text-2xl">O</span>
             </div>
-            <h2 className="text-3xl font-bold text-gray-800 mb-3">Welcome to OrgAI</h2>
+            <h2 className="text-3xl font-bold text-gray-800 mb-3">Welcome to OrgAI</h2> */}
+                                                          <div className="flex items-center justify-center space-x-4 mb-6">
+                                                <div className="w-16 h-16 bg-black rounded-full flex items-center justify-center">
+                                                  <span className="text-white font-bold text-2xl">O</span>
+                                                </div>
+                                                <p className="text-3xl font-bold text-gray-800">OrgAI</p>
+                                                <img src="/logo.jpg" alt="GlokalAI Logo" className="h-10 w-auto" />
+                                              </div> 
+            <h3 className="text-3xl font-bold text-gray-800 mb-3">Welcome to OrgAI</h3>
             <p className="text-gray-600 mb-8">
               Upload documents and start chatting to get intelligent responses powered by advanced RAG technology.
             </p>
@@ -982,14 +992,19 @@ export default function EnhancedMultiDomainRAG() {
                           >
                             {msg.content}
                           </ReactMarkdown>
-                          {msg.streaming && (
+                          {/* {msg.streaming && (
                             <span className="inline-block w-0.5 h-4 bg-blue-600 ml-1 animate-pulse"></span>
-                          )}
+                          )} */}
                         </div>
                       )}
                     </div>
-                    {msg.streaming && msg.role === 'assistant' && (
-                      <Loader2 className="w-4 h-4 text-gray-400 animate-spin flex-shrink-0 mt-0.5" />
+                      {msg.streaming && msg.role === 'assistant' && (
+                      <div className="flex items-center space-x-0 text-gray-400 text-sm">
+                        <span>Thinking</span>
+                        <span className="animate-blink" style={{ animationDelay: '0s' }}>.</span>
+                        <span className="animate-blink" style={{ animationDelay: '0.2s' }}>.</span>
+                        <span className="animate-blink" style={{ animationDelay: '0.4s' }}>.</span>
+                      </div>
                     )}
                   </div>
 

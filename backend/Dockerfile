@@ -17,11 +17,11 @@ COPY backend/requirements.txt /app/backend/requirements.txt
 # Install Python dependencies
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
-# Copy the raganything module (required by backend)
-COPY raganything /app/raganything
-
-# Copy rag_anything_smaranika if it exists
+# Copy rag_anything_smaranika (contains raganything module)
 COPY rag_anything_smaranika /app/rag_anything_smaranika
+
+# Install raganything as an editable package
+RUN pip install -e /app/rag_anything_smaranika
 
 # Copy backend application code
 COPY backend /app/backend
