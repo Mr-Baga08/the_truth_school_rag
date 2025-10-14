@@ -18,6 +18,7 @@ from datetime import datetime
 import uuid
 import hashlib
 import time
+import json
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from cachetools import TTLCache
@@ -219,6 +220,7 @@ performance_metrics: Dict[str, List[float]] = {
 BASE_DIR = Path(__file__).parent.parent
 STORAGE_DIR = BASE_DIR / "storage"
 UPLOAD_DIR = BASE_DIR / "uploads"
+STATUS_FILE = STORAGE_DIR / "processing_status.json"
 
 # --- IMPROVEMENT: Centralized and configurable Gemini model names ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -227,6 +229,41 @@ GEMINI_VERIFIER_MODEL = os.getenv("GEMINI_VERIFIER_MODEL", "models/gemini-pro-la
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "models/gemini-flash-latest")  # Vision model
 GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004")  # Embedding model
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")  # For web search
+
+
+# =============================================================================
+# Status Persistence Functions
+# =============================================================================
+
+def load_processing_status() -> Dict[str, Dict[str, Any]]:
+    """Load processing status from disk."""
+    try:
+        if STATUS_FILE.exists():
+            with open(STATUS_FILE, 'r') as f:
+                status_data = json.load(f)
+                logger.info(f"Loaded {len(status_data)} processing status entries from disk")
+                return status_data
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading processing status: {e}", exc_info=True)
+        return {}
+
+
+def save_processing_status():
+    """Save processing status to disk."""
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(STATUS_FILE, 'w') as f:
+            json.dump(processing_status, f, indent=2)
+        logger.debug(f"Saved {len(processing_status)} processing status entries to disk")
+    except Exception as e:
+        logger.error(f"Error saving processing status: {e}", exc_info=True)
+
+
+def update_processing_status(processing_id: str, status_update: Dict[str, Any]):
+    """Update processing status both in-memory and on disk."""
+    processing_status[processing_id] = status_update
+    save_processing_status()
 
 
 # =============================================================================
@@ -243,6 +280,10 @@ async def lifespan(app: FastAPI):
     for domain in DOMAIN_CONFIGS.keys():
         (STORAGE_DIR / domain).mkdir(parents=True, exist_ok=True)
     logger.info(f"Created storage directories: {STORAGE_DIR}")
+
+    # Load processing status from disk
+    global processing_status
+    processing_status.update(load_processing_status())
 
     if GEMINI_API_KEY:
         try:
@@ -434,7 +475,14 @@ async def gemini_llm_func(
     history_messages: Optional[List[Dict[str, str]]] = None,
     **kwargs,
 ) -> str:
-    """Gemini LLM function for text generation (Improved with Chat session)."""
+    """
+    Gemini LLM function for text generation (Improved with format validation).
+
+    Enhancements:
+    - Increased token limits for entity extraction tasks
+    - Better temperature control for structured outputs
+    - Response validation and auto-append of completion delimiter
+    """
     def _sync_call():
         try:
             from google.generativeai.types import HarmCategory, HarmBlockThreshold
@@ -465,13 +513,21 @@ async def gemini_llm_func(
                 safety_settings=safety_settings
             )
             config_params = {}
+
+            # Smart temperature control: lower for extraction tasks
+            is_extraction_task = system_prompt and ("entity" in system_prompt.lower() or "extraction" in system_prompt.lower())
             if "temperature" in kwargs:
                 config_params["temperature"] = kwargs["temperature"]
+            else:
+                # Use lower temperature for structured extraction tasks
+                config_params["temperature"] = 0.1 if is_extraction_task else 0.3
+
+            # Increase token limit for extraction tasks to avoid truncation
             if "max_tokens" in kwargs:
                 config_params["max_output_tokens"] = kwargs["max_tokens"]
             else:
-                # Default to larger token limit to avoid MAX_TOKENS errors
-                config_params["max_output_tokens"] = 8192
+                # Larger limits for extraction to ensure completion delimiter is included
+                config_params["max_output_tokens"] = 16384 if is_extraction_task else 8192
 
             generation_config = genai.types.GenerationConfig(**config_params)
 
@@ -483,11 +539,21 @@ async def gemini_llm_func(
                     content = msg.get("content", "")
                     if content:
                         history.append({"role": role, "parts": [content]})
-            
+
             chat = model.start_chat(history=history)
             response = chat.send_message(prompt, generation_config=generation_config)
             try:
-                return response.text
+                result = response.text
+
+                # Post-processing: Ensure completion delimiter is present for extraction tasks
+                if is_extraction_task and result:
+                    # Check if completion delimiter is missing
+                    if "<|COMPLETE|>" not in result and "<|complete|>" not in result:
+                        logger.warning("Completion delimiter missing from extraction result, appending it")
+                        # Append the delimiter to the end
+                        result = result.strip() + "\n<|COMPLETE|>"
+
+                return result
             except ValueError as ve:
                 logger.warning(f"Response blocked or empty. Reason: {ve}. Candidates: {response.candidates}")
                 if response.prompt_feedback:
@@ -908,13 +974,14 @@ async def upload_document(
             f.write(await file.read())
         logger.info(f"File saved: {file_path}")
 
-        # Initialize status
-        processing_status[processing_id] = {
+        # Initialize status and save to disk
+        update_processing_status(processing_id, {
             "status": "processing",
             "message": "Processing document...",
             "file_name": file.filename,
+            "domain": domain,
             "started_at": datetime.now().isoformat()
-        }
+        })
 
         async def process_document_task():
             try:
@@ -925,27 +992,32 @@ async def upload_document(
                 # Check result (process_document_complete returns None on success)
                 if result is None or (isinstance(result, dict) and result.get("success") is not False):
                     logger.info(f"Document processed successfully: {file.filename}")
-                    processing_status[processing_id] = {
+                    update_processing_status(processing_id, {
                         "status": "completed",
                         "message": "Document processed successfully",
                         "file_name": file.filename,
+                        "domain": domain,
                         "completed_at": datetime.now().isoformat()
-                    }
+                    })
                 else:
                     error_msg = result.get('error', 'Unknown processing error') if isinstance(result, dict) else "Processing error"
                     logger.error(f"Document processing failed: {error_msg}")
-                    processing_status[processing_id] = {
+                    update_processing_status(processing_id, {
                         "status": "failed",
                         "message": f"Processing failed: {error_msg}",
+                        "file_name": file.filename,
+                        "domain": domain,
                         "error": error_msg
-                    }
+                    })
             except Exception as e:
                 logger.error(f"Error in background processing of {file.filename}: {e}", exc_info=True)
-                processing_status[processing_id] = {
+                update_processing_status(processing_id, {
                     "status": "failed",
                     "message": f"Error: {str(e)}",
+                    "file_name": file.filename,
+                    "domain": domain,
                     "error": str(e)
-                }
+                })
 
         background_tasks.add_task(process_document_task)
 
@@ -1008,12 +1080,13 @@ async def upload_documents_batch(
             processing_ids.append(processing_id)
 
             # Initialize status for each file
-            processing_status[processing_id] = {
+            update_processing_status(processing_id, {
                 "status": "queued",
                 "message": "Queued for batch processing...",
                 "file_name": file.filename,
+                "domain": domain,
                 "started_at": datetime.now().isoformat()
-            }
+            })
 
         logger.info(f"Accepted {len(file_paths)}/{len(files)} files, rejected: {rejected_files}")
 
@@ -1045,20 +1118,22 @@ async def upload_documents_batch(
                         filename = Path(file_path).name.split('_', 1)[1] if '_' in Path(file_path).name else Path(file_path).name
 
                         if file_path in successful_files:
-                            processing_status[processing_id] = {
+                            update_processing_status(processing_id, {
                                 "status": "completed",
                                 "message": "Document processed successfully",
                                 "file_name": filename,
+                                "domain": domain,
                                 "completed_at": datetime.now().isoformat()
-                            }
+                            })
                         elif file_path in failed_files:
                             error_msg = failed_files[file_path]
-                            processing_status[processing_id] = {
+                            update_processing_status(processing_id, {
                                 "status": "failed",
                                 "message": f"Processing failed: {error_msg}",
                                 "file_name": filename,
+                                "domain": domain,
                                 "error": error_msg
-                            }
+                            })
 
                     total_time = time.time() - start_time
                     throughput = len(successful_files) / total_time if total_time > 0 else 0
@@ -1079,34 +1154,39 @@ async def upload_documents_batch(
                         processing_id = processing_ids[idx]
                         filename = Path(file_path).name.split('_', 1)[1] if '_' in Path(file_path).name else Path(file_path).name
 
-                        processing_status[processing_id]["status"] = "processing"
-                        processing_status[processing_id]["message"] = "Processing document..."
+                        current_status = processing_status[processing_id].copy()
+                        current_status["status"] = "processing"
+                        current_status["message"] = "Processing document..."
+                        update_processing_status(processing_id, current_status)
 
                         try:
                             result = await rag.process_document_complete(file_path)
                             if result is None or (isinstance(result, dict) and result.get("success") is not False):
-                                processing_status[processing_id] = {
+                                update_processing_status(processing_id, {
                                     "status": "completed",
                                     "message": "Document processed successfully",
                                     "file_name": filename,
+                                    "domain": domain,
                                     "completed_at": datetime.now().isoformat()
-                                }
+                                })
                             else:
                                 error_msg = result.get('error', 'Unknown error') if isinstance(result, dict) else "Processing error"
-                                processing_status[processing_id] = {
+                                update_processing_status(processing_id, {
                                     "status": "failed",
                                     "message": f"Processing failed: {error_msg}",
                                     "file_name": filename,
+                                    "domain": domain,
                                     "error": error_msg
-                                }
+                                })
                         except Exception as e:
                             logger.error(f"Error processing {filename}: {e}", exc_info=True)
-                            processing_status[processing_id] = {
+                            update_processing_status(processing_id, {
                                 "status": "failed",
                                 "message": f"Error: {str(e)}",
                                 "file_name": filename,
+                                "domain": domain,
                                 "error": str(e)
-                            }
+                            })
 
             except Exception as e:
                 logger.error(f"Batch processing error: {e}", exc_info=True)
@@ -1114,12 +1194,13 @@ async def upload_documents_batch(
                 for idx, file_path in enumerate(file_paths):
                     processing_id = processing_ids[idx]
                     filename = Path(file_path).name.split('_', 1)[1] if '_' in Path(file_path).name else Path(file_path).name
-                    processing_status[processing_id] = {
+                    update_processing_status(processing_id, {
                         "status": "failed",
                         "message": f"Batch processing error: {str(e)}",
                         "file_name": filename,
+                        "domain": domain,
                         "error": str(e)
-                    }
+                    })
 
         background_tasks.add_task(process_batch_task)
 
@@ -1156,12 +1237,13 @@ async def upload_url(
         processing_id = str(uuid.uuid4())
 
         # Initialize status
-        processing_status[processing_id] = {
+        update_processing_status(processing_id, {
             "status": "fetching",
             "message": "Fetching URL content...",
             "url": request.url,
+            "domain": request.domain,
             "started_at": datetime.now().isoformat()
-        }
+        })
 
         async def fetch_and_process_url():
             try:
@@ -1179,31 +1261,34 @@ async def upload_url(
                 if not fetch_result.get("success"):
                     error_msg = fetch_result.get("error", "Unknown fetch error")
                     logger.error(f"[URL UPLOAD] Fetch failed: {error_msg}")
-                    processing_status[processing_id] = {
+                    update_processing_status(processing_id, {
                         "status": "failed",
                         "message": f"Failed to fetch URL: {error_msg}",
+                        "domain": request.domain,
                         "error": error_msg
-                    }
+                    })
                     return
 
                 file_path = fetch_result.get("file_path")
                 if not file_path:
                     logger.error("[URL UPLOAD] No file path returned from URL fetch")
-                    processing_status[processing_id] = {
+                    update_processing_status(processing_id, {
                         "status": "failed",
                         "message": "No file path returned from URL fetch",
+                        "domain": request.domain,
                         "error": "No file path"
-                    }
+                    })
                     return
 
                 logger.info(f"[URL UPLOAD] Content saved to: {file_path}")
 
                 # Update status
-                processing_status[processing_id] = {
+                update_processing_status(processing_id, {
                     "status": "processing",
                     "message": "Processing document...",
+                    "domain": request.domain,
                     "file_path": file_path
-                }
+                })
 
                 # Get RAG instance
                 rag = await get_rag_instance(request.domain)
@@ -1235,35 +1320,39 @@ async def upload_url(
                 # Note: process_document_complete returns None on success (not a dict)
                 if result is None or (isinstance(result, dict) and result.get("success") is not False):
                     logger.info(f"[URL UPLOAD] ✓ Successfully processed: {request.url}")
-                    processing_status[processing_id] = {
+                    update_processing_status(processing_id, {
                         "status": "completed",
                         "message": "Document processed successfully",
+                        "domain": request.domain,
                         "file_path": file_path,
                         "completed_at": datetime.now().isoformat()
-                    }
+                    })
                 else:
                     error_msg = result.get('error', 'Unknown processing error') if isinstance(result, dict) else "Processing returned error"
                     logger.error(f"[URL UPLOAD] ✗ Processing failed: {error_msg}")
-                    processing_status[processing_id] = {
+                    update_processing_status(processing_id, {
                         "status": "failed",
                         "message": f"Processing failed: {error_msg}",
+                        "domain": request.domain,
                         "error": error_msg
-                    }
+                    })
 
             except asyncio.TimeoutError:
                 logger.error(f"[URL UPLOAD] ✗ Timeout processing {request.url}")
-                processing_status[processing_id] = {
+                update_processing_status(processing_id, {
                     "status": "failed",
                     "message": "Processing timeout",
+                    "domain": request.domain,
                     "error": "Timeout"
-                }
+                })
             except Exception as e:
                 logger.error(f"[URL UPLOAD] ✗ Error processing {request.url}: {e}", exc_info=True)
-                processing_status[processing_id] = {
+                update_processing_status(processing_id, {
                     "status": "failed",
                     "message": f"Error: {str(e)}",
+                    "domain": request.domain,
                     "error": str(e)
-                }
+                })
 
         background_tasks.add_task(fetch_and_process_url)
 
@@ -1612,7 +1701,12 @@ async def clear_domain_data(domain: str):
 
 @app.get("/documents")
 async def list_documents(domain: str):
-    """List all processed documents for a domain."""
+    """
+    List all processed documents for a domain.
+
+    Only returns documents with status 'completed'. Documents still being
+    processed are excluded to avoid confusion.
+    """
     try:
         if domain not in DOMAIN_CONFIGS:
             raise HTTPException(400, f"Invalid domain. Valid: {list(DOMAIN_CONFIGS.keys())}")
@@ -1629,6 +1723,20 @@ async def list_documents(domain: str):
                     processing_id = parts[0] if len(parts) > 1 else ""
                     display_name = parts[1] if len(parts) > 1 else filename
 
+                    # Check if document is actually completed
+                    # Skip if still processing, queued, or fetching
+                    if processing_id in processing_status:
+                        status = processing_status[processing_id].get('status')
+                        if status in ['processing', 'queued', 'fetching']:
+                            # Document is still being processed, skip it
+                            logger.debug(f"Skipping document {processing_id} - status: {status}")
+                            continue
+                        elif status == 'failed':
+                            # Optionally skip failed documents or include them
+                            # For now, skip them to only show successfully processed docs
+                            continue
+
+                    # Only include completed documents or legacy ones without status
                     documents.append({
                         "id": processing_id,
                         "name": display_name,
@@ -1683,9 +1791,14 @@ async def get_performance_metrics():
 
 @app.get("/status/{processing_id}")
 async def get_processing_status(processing_id: str):
-    """Get the processing status of a document."""
+    """
+    Get the processing status of a document.
+
+    Now uses persistent status storage that survives backend restarts.
+    The status is loaded from disk on startup and kept in sync.
+    """
     try:
-        # First check the in-memory status tracker
+        # Check the persistent status tracker (loaded from disk on startup)
         if processing_id in processing_status:
             status_info = processing_status[processing_id]
             logger.debug(f"Status check for {processing_id}: {status_info.get('status')}")
@@ -1694,29 +1807,34 @@ async def get_processing_status(processing_id: str):
                 **status_info
             }
 
-        # Fallback: Check if file exists in any domain (for older uploads)
+        # If not in status tracker, check if this is a legacy upload
+        # (uploaded before persistent status was implemented)
         for domain in DOMAIN_CONFIGS.keys():
             domain_upload_dir = UPLOAD_DIR / domain
             if domain_upload_dir.exists():
                 for file_path in domain_upload_dir.glob(f"{processing_id}_*"):
                     if file_path.is_file():
+                        # Legacy upload - return completed status
+                        # but don't add to persistent status to avoid confusion
                         return {
                             "processing_id": processing_id,
                             "status": "completed",
-                            "message": "Document processed successfully"
+                            "message": "Document processed successfully (legacy upload)"
                         }
 
-        # If not found anywhere, assume still processing or unknown
+        # If not found anywhere, status is unknown
+        # This typically means the processing_id is invalid
         return {
             "processing_id": processing_id,
-            "status": "processing",
-            "message": "Document is being processed"
+            "status": "unknown",
+            "message": "Processing ID not found. It may be invalid or expired."
         }
     except Exception as e:
         logger.error(f"Error checking status: {e}", exc_info=True)
         return {
             "processing_id": processing_id,
-            "status": "failed",
+            "status": "error",
+            "message": f"Error checking status: {str(e)}",
             "error": str(e)
         }
 

@@ -108,7 +108,9 @@ export default function EnhancedMultiDomainRAG() {
     getFromLocalStorage('selectedDomain', 'medical')
   );
   const [currentView, setCurrentView] = useState('app'); // 'app', 'files', 'settings'
-  const [processingDocs, setProcessingDocs] = useState([]);
+  const [processingDocs, setProcessingDocs] = useState(() =>
+    getFromLocalStorage('processingDocs', [])
+  );
   const [processedDocs, setProcessedDocs] = useState([]);
   const [query, setQuery] = useState('');
   const [messages, setMessages] = useState(() =>
@@ -172,6 +174,15 @@ export default function EnhancedMultiDomainRAG() {
       console.error('Error saving domain to localStorage:', error);
     }
   }, [selectedDomain]);
+
+  // Persist processingDocs to localStorage
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('processingDocs', JSON.stringify(processingDocs));
+    } catch (error) {
+      console.error('Error saving processingDocs to localStorage:', error);
+    }
+  }, [processingDocs]);
 
   // Persist web search settings to localStorage
   useEffect(() => {
