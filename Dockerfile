@@ -1,10 +1,10 @@
 
 FROM python:3.12-slim
 
-# Set working directory
+
 WORKDIR /app
 
-# Install system dependencies
+
 RUN apt-get update && apt-get install -y \
     curl \
     wget \
@@ -15,75 +15,94 @@ RUN apt-get update && apt-get install -y \
     npm \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy backend requirements and install Python dependencies
+
 COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir --use-pep517 -r /app/backend/requirements.txt
 
-# Copy backend code
+
 COPY backend/ /app/backend/
 COPY rag_anything_smaranika/ /app/rag_anything_smaranika/
 
-# Copy frontend code
+
 COPY frontend/ /app/frontend/
 
-# Build frontend
+
 WORKDIR /app/frontend
 RUN npm install
 RUN REACT_APP_BACKEND_URL=/api npm run build
 
-# Configure nginx to serve frontend and proxy backend
-RUN echo 'server { \
-    listen 7860; \
-    server_name _; \
-    \
-    # Serve frontend \
-    location / { \
-        root /app/frontend/build; \
-        try_files $uri $uri/ /index.html; \
-    } \
-    \
-    # Proxy backend API \
-    location /api/ { \
-        proxy_pass http://127.0.0.1:8000/; \
-        proxy_http_version 1.1; \
-        proxy_set_header Upgrade $http_upgrade; \
-        proxy_set_header Connection "upgrade"; \
-        proxy_set_header Host $host; \
-        proxy_set_header X-Real-IP $remote_addr; \
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; \
-        proxy_set_header X-Forwarded-Proto $scheme; \
-        proxy_buffering off; \
-        proxy_cache_bypass $http_upgrade; \
-    } \
-    \
-    # Health check endpoint \
-    location /health { \
-        proxy_pass http://127.0.0.1:8000/health; \
-        proxy_http_version 1.1; \
-        proxy_set_header Host $host; \
-    } \
-}' > /etc/nginx/sites-available/default
 
-# Create necessary directories with proper permissions
+
+RUN mkdir -p /var/lib/nginx/body /var/lib/nginx/fastcgi \
+    /var/lib/nginx/proxy /var/lib/nginx/scgi /var/lib/nginx/uwsgi \
+    /var/log/nginx /var/cache/nginx && \
+    chmod -R 777 /var/lib/nginx /var/log/nginx /var/cache/nginx && \
+    touch /var/run/nginx.pid && chmod 666 /var/run/nginx.pid
+
+
+RUN echo 'pid /tmp/nginx.pid;\n\
+error_log /var/log/nginx/error.log;\n\
+events {\n\
+    worker_connections 1024;\n\
+}\n\
+http {\n\
+    include /etc/nginx/mime.types;\n\
+    default_type application/octet-stream;\n\
+    access_log /var/log/nginx/access.log;\n\
+    client_body_temp_path /tmp/client_body;\n\
+    proxy_temp_path /tmp/proxy;\n\
+    fastcgi_temp_path /tmp/fastcgi;\n\
+    uwsgi_temp_path /tmp/uwsgi;\n\
+    scgi_temp_path /tmp/scgi;\n\
+    \n\
+    server {\n\
+        listen 7860;\n\
+        server_name _;\n\
+        \n\
+        location / {\n\
+            root /app/frontend/build;\n\
+            try_files $uri $uri/ /index.html;\n\
+        }\n\
+        \n\
+        location /api/ {\n\
+            proxy_pass http://127.0.0.1:8000/;\n\
+            proxy_http_version 1.1;\n\
+            proxy_set_header Upgrade $http_upgrade;\n\
+            proxy_set_header Connection "upgrade";\n\
+            proxy_set_header Host $host;\n\
+            proxy_set_header X-Real-IP $remote_addr;\n\
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n\
+            proxy_set_header X-Forwarded-Proto $scheme;\n\
+            proxy_buffering off;\n\
+            proxy_cache_bypass $http_upgrade;\n\
+        }\n\
+        \n\
+        location /health {\n\
+            proxy_pass http://127.0.0.1:8000/health;\n\
+            proxy_http_version 1.1;\n\
+            proxy_set_header Host $host;\n\
+        }\n\
+    }\n\
+}' > /etc/nginx/nginx.conf
+
+
 RUN mkdir -p /app/storage /app/uploads /app/backend/output && \
     chmod -R 777 /app/storage /app/uploads /app/backend/output
 
-# Set working directory back to /app
 WORKDIR /app
 
-# Install raganything package
 WORKDIR /app/rag_anything_smaranika
 RUN pip install --no-cache-dir -e .
 
-# Back to app directory
+
 WORKDIR /app
 
-# Ensure storage directories for all domains exist with proper permissions
+
 RUN mkdir -p /app/storage/medical /app/storage/legal /app/storage/financial \
     /app/storage/technical /app/storage/academic && \
     chmod -R 777 /app/storage
 
-# Create startup script
+
 RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
@@ -134,14 +153,13 @@ echo ""\n\
 wait $BACKEND_PID $NGINX_PID\n\
 ' > /app/start.sh && chmod +x /app/start.sh
 
-# Expose port 7860 (Hugging Face Space requirement)
+
 EXPOSE 7860
 
-# Health check
+
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:7860/health || exit 1
 
-# Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app:$PYTHONPATH
 ENV BACKEND_PORT=8000
