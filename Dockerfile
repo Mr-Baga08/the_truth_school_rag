@@ -1,6 +1,3 @@
-# Hugging Face Docker Space Dockerfile
-# This combines backend and frontend into a single container for Hugging Face Spaces
-# Exposes port 7860 as required by Hugging Face
 
 FROM python:3.10-slim
 
@@ -18,18 +15,11 @@ RUN apt-get update && apt-get install -y \
     npm \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy rag_anything_smaranika first to install as package
-COPY rag_anything_smaranika/ /app/rag_anything_smaranika/
-
-# Install rag_anything_smaranika package
-WORKDIR /app/rag_anything_smaranika
-RUN pip install --no-cache-dir -e .
-
 # Copy backend requirements and install Python dependencies
 COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
-# Install additional dependencies
+# Install raganything dependencies (if not in requirements.txt)
 RUN pip install --no-cache-dir \
     lightrag-hku \
     cachetools \
@@ -37,6 +27,7 @@ RUN pip install --no-cache-dir \
 
 # Copy backend code
 COPY backend/ /app/backend/
+COPY rag_anything_smaranika/ /app/rag_anything_smaranika/
 
 # Copy frontend code
 COPY frontend/ /app/frontend/
@@ -85,52 +76,6 @@ RUN mkdir -p /app/storage /app/uploads /app/backend/output
 # Set working directory back to /app
 WORKDIR /app
 
-# Create startup script
-RUN echo '#!/bin/bash\n\
-set -e\n\
-\n\
-echo "Starting Agentic RAG System for Hugging Face Space..."\n\
-\n\
-# Check for required environment variables\n\
-if [ -z "$GEMINI_API_KEY" ]; then\n\
-    echo "ERROR: GEMINI_API_KEY environment variable is not set!"\n\
-    echo "Please set it in your Hugging Face Space settings."\n\
-    exit 1\n\
-fi\n\
-\n\
-# Start backend in background\n\
-echo "Starting FastAPI backend on port 8000..."\n\
-cd /app\n\
-export PYTHONPATH=/app:$PYTHONPATH\n\
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --log-level info &\n\
-BACKEND_PID=$!\n\
-\n\
-# Wait for backend to be ready\n\
-echo "Waiting for backend to be ready..."\n\
-for i in {1..30}; do\n\
-    if curl -s http://127.0.0.1:8000/health > /dev/null; then\n\
-        echo "Backend is ready!"\n\
-        break\n\
-    fi\n\
-    echo "Waiting for backend... ($i/30)"\n\
-    sleep 2\n\
-done\n\
-\n\
-# Start nginx\n\
-echo "Starting nginx on port 7860..."\n\
-nginx -g "daemon off;" &\n\
-NGINX_PID=$!\n\
-\n\
-echo "==========================================="\n\
-echo "Agentic RAG System is running!"\n\
-echo "Backend: http://localhost:8000"\n\
-echo "Frontend: http://localhost:7860"\n\
-echo "API Docs: http://localhost:8000/docs"\n\
-echo "==========================================="\n\
-\n\
-# Wait for both processes\n\
-wait $BACKEND_PID $NGINX_PID\n\
-' > /app/start.sh && chmod +x /app/start.sh
 
 # Expose port 7860 (Hugging Face Space requirement)
 EXPOSE 7860
@@ -141,7 +86,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app:$PYTHONPATH
 ENV BACKEND_PORT=8000
 ENV FRONTEND_PORT=7860
 
