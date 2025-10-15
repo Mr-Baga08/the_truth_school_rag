@@ -18,11 +18,18 @@ RUN apt-get update && apt-get install -y \
     npm \
     && rm -rf /var/lib/apt/lists/*
 
+# Copy rag_anything_smaranika first to install as package
+COPY rag_anything_smaranika/ /app/rag_anything_smaranika/
+
+# Install rag_anything_smaranika package
+WORKDIR /app/rag_anything_smaranika
+RUN pip install --no-cache-dir -e .
+
 # Copy backend requirements and install Python dependencies
 COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
-# Install raganything dependencies (if not in requirements.txt)
+# Install additional dependencies
 RUN pip install --no-cache-dir \
     lightrag-hku \
     cachetools \
@@ -30,7 +37,6 @@ RUN pip install --no-cache-dir \
 
 # Copy backend code
 COPY backend/ /app/backend/
-COPY rag_anything_smaranika/ /app/rag_anything_smaranika/
 
 # Copy frontend code
 COPY frontend/ /app/frontend/
@@ -94,8 +100,9 @@ fi\n\
 \n\
 # Start backend in background\n\
 echo "Starting FastAPI backend on port 8000..."\n\
-cd /app/backend\n\
-python -m uvicorn main:app --host 127.0.0.1 --port 8000 --log-level info &\n\
+cd /app\n\
+export PYTHONPATH=/app:$PYTHONPATH\n\
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --log-level info &\n\
 BACKEND_PID=$!\n\
 \n\
 # Wait for backend to be ready\n\
@@ -134,6 +141,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app:$PYTHONPATH
 ENV BACKEND_PORT=8000
 ENV FRONTEND_PORT=7860
 
