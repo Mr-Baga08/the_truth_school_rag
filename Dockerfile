@@ -86,8 +86,8 @@ http {\n\
 }' > /etc/nginx/nginx.conf
 
 
-RUN mkdir -p /app/storage /app/uploads /app/backend/output /app/output && \
-    chmod -R 777 /app/storage /app/uploads /app/backend/output /app/output
+RUN mkdir -p /app/storage /app/uploads /app/backend/output /app/output /app/.cache/huggingface && \
+    chmod -R 777 /app/storage /app/uploads /app/backend/output /app/output /app/.cache
 
 WORKDIR /app
 
@@ -165,6 +165,9 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app:$PYTHONPATH
 ENV BACKEND_PORT=8000
 ENV FRONTEND_PORT=7860
+ENV HF_HOME=/app/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/app/.cache/huggingface
+ENV HF_DATASETS_CACHE=/app/.cache/huggingface/datasets
 
 # Start the application
 CMD ["/app/start.sh"]
