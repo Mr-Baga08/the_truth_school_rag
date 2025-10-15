@@ -1,0 +1,44 @@
+# Agentic RAG System - Root Requirements
+# This file includes all backend dependencies for Hugging Face Space deployment
+
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Async Support
+asyncio==3.4.3
+
+# Google Gemini API
+google-generativeai>=0.8.0
+
+# Image Processing (for Vision API)
+Pillow==10.1.0
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# Logging
+python-json-logger==2.0.7
+
+# Validation
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# CORS
+fastapi-cors==0.0.6
+
+# Web Search & URL Fetching
+tavily-python>=0.3.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+markdownify>=0.11.0
+
+# RAG Framework
+lightrag-hku>=0.0.1
+
+# Caching
+cachetools>=5.3.0
+
+# Async File Operations
+aiofiles>=23.0.0

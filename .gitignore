@@ -3,30 +3,78 @@ node_modules/
 frontend/node_modules/
 backend/__pycache__/
 venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
 
 # Build outputs
 frontend/build/
-*.pyc
+dist/
+build/
+*.egg-info/
+.eggs/
 
 # Cache
 frontend/node_modules/.cache/
 .cache/
+.pytest_cache/
+.mypy_cache/
 
 # Environment variables
 .env
-*.env.local
+.env.local
+.env.*.local
+*.env
+backend/.env
+frontend/.env
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
+*.log
 
 # Output files
 backend/output/
+*.out
 
-# Storage
+# Storage (runtime data - don't commit to git)
 storage/
 uploads/
+rag_anything_smaranika/__pycache__/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Docker
+*.pid
+.docker/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
