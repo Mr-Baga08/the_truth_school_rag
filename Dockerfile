@@ -122,8 +122,6 @@ fi\n\
 echo "Starting FastAPI backend on port 8000..."\n\
 cd /app\n\
 export PYTHONPATH=/app:$PYTHONPATH\n\
-# Ensure output directory exists with proper permissions\n\
-mkdir -p /app/output /app/backend/output && chmod -R 777 /app/output /app/backend/output\n\
 python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --log-level info &\n\
 BACKEND_PID=$!\n\
 \n\
