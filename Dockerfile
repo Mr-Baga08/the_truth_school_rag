@@ -64,8 +64,9 @@ RUN echo 'server { \
     } \
 }' > /etc/nginx/sites-available/default
 
-# Create necessary directories
-RUN mkdir -p /app/storage /app/uploads /app/backend/output
+# Create necessary directories with proper permissions
+RUN mkdir -p /app/storage /app/uploads /app/backend/output && \
+    chmod -R 777 /app/storage /app/uploads /app/backend/output
 
 # Set working directory back to /app
 WORKDIR /app
@@ -76,6 +77,11 @@ RUN pip install --no-cache-dir -e .
 
 # Back to app directory
 WORKDIR /app
+
+# Ensure storage directories for all domains exist with proper permissions
+RUN mkdir -p /app/storage/medical /app/storage/legal /app/storage/financial \
+    /app/storage/technical /app/storage/academic && \
+    chmod -R 777 /app/storage
 
 # Create startup script
 RUN echo '#!/bin/bash\n\
