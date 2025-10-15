@@ -17,13 +17,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy backend requirements and install Python dependencies
 COPY backend/requirements.txt /app/backend/requirements.txt
-RUN pip install --no-cache-dir -r /app/backend/requirements.txt
-
-# Install raganything dependencies (if not in requirements.txt)
-RUN pip install --no-cache-dir \
-    lightrag-hku \
-    cachetools \
-    aiofiles
+RUN pip install --no-cache-dir --use-pep517 -r /app/backend/requirements.txt
 
 # Copy backend code
 COPY backend/ /app/backend/
