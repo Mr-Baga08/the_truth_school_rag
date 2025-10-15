@@ -36,6 +36,6 @@ cachetools==5.3.3
 aiofiles==23.2.1
 
 # LightRAG and its key dependencies (pinned to avoid conflicts)
-lightrag-hku==0.0.0.4rc5
+lightrag-hku==1.4.9.3
 nano-vectordb==0.1.1
 networkx==3.4.2
