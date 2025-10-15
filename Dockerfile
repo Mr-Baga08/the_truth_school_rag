@@ -29,7 +29,7 @@ COPY frontend/ /app/frontend/
 
 WORKDIR /app/frontend
 RUN npm install
-RUN REACT_APP_BACKEND_URL=/api npm run build
+RUN REACT_APP_API_URL=/api npm run build
 
 
 
