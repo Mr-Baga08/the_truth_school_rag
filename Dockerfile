@@ -86,21 +86,22 @@ http {\n\
 }' > /etc/nginx/nginx.conf
 
 
-RUN mkdir -p /app/storage /app/uploads /app/backend/output && \
-    chmod -R 777 /app/storage /app/uploads /app/backend/output
+RUN mkdir -p /app/storage /app/uploads /app/backend/output /app/output && \
+    chmod -R 777 /app/storage /app/uploads /app/backend/output /app/output
 
 WORKDIR /app
 
 WORKDIR /app/rag_anything_smaranika
 RUN pip install --no-cache-dir -e .
 
-
 WORKDIR /app
-
 
 RUN mkdir -p /app/storage/medical /app/storage/legal /app/storage/financial \
     /app/storage/technical /app/storage/academic && \
     chmod -R 777 /app/storage
+
+# Create output directory in the working directory for the parser
+RUN mkdir -p /app/output && chmod -R 777 /app/output
 
 
 RUN echo '#!/bin/bash\n\
@@ -121,6 +122,8 @@ fi\n\
 echo "Starting FastAPI backend on port 8000..."\n\
 cd /app\n\
 export PYTHONPATH=/app:$PYTHONPATH\n\
+# Ensure output directory exists with proper permissions\n\
+mkdir -p /app/output /app/backend/output && chmod -R 777 /app/output /app/backend/output\n\
 python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --log-level info &\n\
 BACKEND_PID=$!\n\
 \n\
