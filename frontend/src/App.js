@@ -27,7 +27,9 @@ import {
   RefreshCw,
   Moon,
   Sun,
-  Sparkles
+  Sparkles,
+  User,
+  Bot
 } from 'lucide-react';
 
 // =============================================================================
@@ -760,69 +762,104 @@ export default function TheTruthSchoolAI() {
           </div>
         </div>
       ) : (
-        <div className="flex-1 overflow-y-auto px-4 py-6">
-          <div className="max-w-3xl mx-auto space-y-6">
+        <div className="flex-1 overflow-y-auto">
+          <div className="max-w-4xl mx-auto">
             {messages.map((msg, idx) => (
-              <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-[80%] ${msg.role === 'user' ? 'bg-blue-600 text-white' : `${theme.assistantMessage} ${theme.text}`} rounded-2xl px-5 py-4 shadow-sm`}>
-                  {msg.role === 'user' ? (
-                    <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
-                  ) : (
-                    <div className={`text-sm prose prose-sm max-w-none ${darkMode ? 'prose-invert' : ''}`}>
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        rehypePlugins={[rehypeHighlight]}
-                        components={{
-                          code({ node, inline, className, children, ...props }) {
-                            return inline ? (
-                              <code className={`${darkMode ? 'bg-gray-700 text-gray-100' : 'bg-gray-200 text-gray-800'} px-1.5 py-0.5 rounded text-xs font-mono`} {...props}>
-                                {children}
-                              </code>
-                            ) : (
-                              <code className={className} {...props}>
-                                {children}
-                              </code>
-                            );
-                          },
-                          a({ node, children, ...props }) {
-                            return (
-                              <a className={`${darkMode ? 'text-blue-400' : 'text-blue-600'} hover:underline`} target="_blank" rel="noopener noreferrer" {...props}>
-                                {children}
-                              </a>
-                            );
-                          },
-                          table: ({ node, ...props }) => (
-                            <div className="overflow-x-auto my-4">
-                              <table className={`min-w-full divide-y ${darkMode ? 'divide-gray-700 border-gray-700' : 'divide-gray-300 border-gray-300'} border rounded-lg`} {...props} />
-                            </div>
-                          ),
-                          thead: ({ node, ...props }) => (
-                            <thead className={darkMode ? 'bg-gray-800' : 'bg-gray-100'} {...props} />
-                          ),
-                          tbody: ({ node, ...props }) => (
-                            <tbody className={`divide-y ${darkMode ? 'divide-gray-700 bg-gray-900' : 'divide-gray-200 bg-white'}`} {...props} />
-                          ),
-                          th: ({ node, ...props }) => (
-                            <th className={`px-4 py-3 text-left text-xs font-bold uppercase tracking-wider ${darkMode ? 'text-gray-300 border-gray-700' : 'text-gray-700 border-gray-300'} border-r last:border-r-0`} {...props} />
-                          ),
-                          td: ({ node, ...props }) => (
-                            <td className={`px-4 py-3 text-sm ${darkMode ? 'text-gray-300 border-gray-700' : 'text-gray-900 border-gray-200'} border-r last:border-r-0`} {...props} />
-                          ),
-                          tr: ({ node, ...props }) => (
-                            <tr className={darkMode ? 'hover:bg-gray-800' : 'hover:bg-gray-50'} {...props} />
-                          ),
-                        }}
-                      >
-                        {msg.content}
-                      </ReactMarkdown>
+              <div
+                key={idx}
+                className={`w-full py-8 px-4 ${msg.role === 'user' ? theme.bg : theme.bgSecondary}`}
+              >
+                <div className="max-w-3xl mx-auto flex gap-6">
+                  {/* Avatar */}
+                  <div className="flex-shrink-0">
+                    {msg.role === 'user' ? (
+                      <div className={`w-8 h-8 rounded-full ${darkMode ? 'bg-blue-600' : 'bg-blue-600'} flex items-center justify-center`}>
+                        <User className="w-5 h-5 text-white" />
+                      </div>
+                    ) : (
+                      <div className={`w-8 h-8 rounded-full ${darkMode ? 'bg-gradient-to-br from-purple-500 to-blue-500' : 'bg-gradient-to-br from-blue-600 to-purple-600'} flex items-center justify-center`}>
+                        <Bot className="w-5 h-5 text-white" />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Message Content */}
+                  <div className="flex-1 min-w-0">
+                    <div className={`font-semibold ${theme.text} mb-2 text-sm`}>
+                      {msg.role === 'user' ? 'You' : 'TheTruthSchool AI'}
                     </div>
-                  )}
-                  {msg.streaming && msg.role === 'assistant' && (
-                    <div className={`flex items-center space-x-1 ${theme.textMuted} text-sm mt-2`}>
-                      <span>Thinking</span>
-                      <span className="animate-pulse">...</span>
-                    </div>
-                  )}
+
+                    {msg.role === 'user' ? (
+                      <p className={`${theme.text} whitespace-pre-wrap leading-relaxed`}>{msg.content}</p>
+                    ) : (
+                      <div className={`prose prose-sm max-w-none leading-relaxed ${darkMode ? 'prose-invert' : ''}`}>
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          rehypePlugins={[rehypeHighlight]}
+                          components={{
+                            code({ node, inline, className, children, ...props }) {
+                              return inline ? (
+                                <code className={`${darkMode ? 'bg-gray-700 text-gray-100' : 'bg-gray-200 text-gray-800'} px-1.5 py-0.5 rounded text-xs font-mono`} {...props}>
+                                  {children}
+                                </code>
+                              ) : (
+                                <code className={className} {...props}>
+                                  {children}
+                                </code>
+                              );
+                            },
+                            a({ node, children, ...props }) {
+                              return (
+                                <a className={`${darkMode ? 'text-blue-400' : 'text-blue-600'} hover:underline`} target="_blank" rel="noopener noreferrer" {...props}>
+                                  {children}
+                                </a>
+                              );
+                            },
+                            table: ({ node, ...props }) => (
+                              <div className="overflow-x-auto my-4">
+                                <table className={`min-w-full divide-y ${darkMode ? 'divide-gray-700 border-gray-700' : 'divide-gray-300 border-gray-300'} border rounded-lg`} {...props} />
+                              </div>
+                            ),
+                            thead: ({ node, ...props }) => (
+                              <thead className={darkMode ? 'bg-gray-800' : 'bg-gray-100'} {...props} />
+                            ),
+                            tbody: ({ node, ...props }) => (
+                              <tbody className={`divide-y ${darkMode ? 'divide-gray-700 bg-gray-900' : 'divide-gray-200 bg-white'}`} {...props} />
+                            ),
+                            th: ({ node, ...props }) => (
+                              <th className={`px-4 py-3 text-left text-xs font-bold uppercase tracking-wider ${darkMode ? 'text-gray-300 border-gray-700' : 'text-gray-700 border-gray-300'} border-r last:border-r-0`} {...props} />
+                            ),
+                            td: ({ node, ...props }) => (
+                              <td className={`px-4 py-3 text-sm ${darkMode ? 'text-gray-300 border-gray-700' : 'text-gray-900 border-gray-200'} border-r last:border-r-0`} {...props} />
+                            ),
+                            tr: ({ node, ...props }) => (
+                              <tr className={darkMode ? 'hover:bg-gray-800' : 'hover:bg-gray-50'} {...props} />
+                            ),
+                          }}
+                        >
+                          {msg.content}
+                        </ReactMarkdown>
+                      </div>
+                    )}
+
+                    {msg.streaming && msg.role === 'assistant' && (
+                      <div className={`flex items-center space-x-2 ${theme.textMuted} text-sm mt-3`}>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Thinking...</span>
+                      </div>
+                    )}
+
+                    {msg.verification && (
+                      <div className={`mt-4 p-3 ${darkMode ? 'bg-green-900/20 border-green-800' : 'bg-green-50 border-green-200'} border rounded-lg`}>
+                        <div className="flex items-start gap-2">
+                          <CheckCircle className="w-4 h-4 text-green-600 flex-shrink-0 mt-0.5" />
+                          <div className={`text-xs ${darkMode ? 'text-green-300' : 'text-green-800'}`}>
+                            <span className="font-semibold">Verified:</span> {msg.verification}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
             ))}
