@@ -16,9 +16,15 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 
-COPY backend/requirements.txt /app/backend/requirements.txt
-RUN pip install --no-cache-dir --use-pep517 -r /app/backend/requirements.txt
+# Copy modified LightRAG package first
+COPY local_packages/ /app/local_packages/
 
+COPY backend/requirements.txt /app/backend/requirements.txt
+
+# Install Python dependencies (excluding lightrag-hku, will use modified version)
+RUN grep -v "lightrag-hku" /app/backend/requirements.txt > /tmp/requirements_no_lightrag.txt && \
+    pip install --no-cache-dir --use-pep517 -r /tmp/requirements_no_lightrag.txt && \
+    pip install --no-cache-dir -e /app/local_packages/
 
 COPY backend/ /app/backend/
 COPY rag_anything_smaranika/ /app/rag_anything_smaranika/
@@ -168,6 +174,9 @@ ENV FRONTEND_PORT=7860
 ENV HF_HOME=/app/.cache/huggingface
 ENV TRANSFORMERS_CACHE=/app/.cache/huggingface
 ENV HF_DATASETS_CACHE=/app/.cache/huggingface/datasets
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONHASHSEED=0
+ENV PYTHONOPTIMIZE=0
 
 # Start the application
 CMD ["/app/start.sh"]
