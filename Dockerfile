@@ -19,6 +19,9 @@ RUN apt-get update && apt-get install -y \
 COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir --use-pep517 -r /app/backend/requirements.txt
 
+# Copy local modified LightRAG package in vendor directory
+COPY vendor/ /app/vendor/
+
 COPY backend/ /app/backend/
 COPY rag_anything_smaranika/ /app/rag_anything_smaranika/
 
@@ -120,7 +123,7 @@ fi\n\
 # Start backend in background\n\
 echo "Starting FastAPI backend on port 8000..."\n\
 cd /app\n\
-export PYTHONPATH=/app:$PYTHONPATH\n\
+export PYTHONPATH=/app:/app/vendor:$PYTHONPATH\n\
 python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --log-level info &\n\
 BACKEND_PID=$!\n\
 \n\
@@ -161,7 +164,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:7860/health || exit 1
 
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app:$PYTHONPATH
+ENV PYTHONPATH=/app:/app/vendor:$PYTHONPATH
 ENV BACKEND_PORT=8000
 ENV FRONTEND_PORT=7860
 ENV HF_HOME=/app/.cache/huggingface

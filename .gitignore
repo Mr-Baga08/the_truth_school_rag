@@ -86,3 +86,7 @@ temp/
 *.gif
 *.svg
 *.ico
+
+# Local LightRAG package in vendor directory
+vendor/lightrag/__pycache__/
+vendor/**/__pycache__/
