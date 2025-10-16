@@ -16,15 +16,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 
-# Copy modified LightRAG package first
-COPY local_packages/ /app/local_packages/
-
 COPY backend/requirements.txt /app/backend/requirements.txt
-
-# Install Python dependencies (excluding lightrag-hku, will use modified version)
-RUN grep -v "lightrag-hku" /app/backend/requirements.txt > /tmp/requirements_no_lightrag.txt && \
-    pip install --no-cache-dir --use-pep517 -r /tmp/requirements_no_lightrag.txt && \
-    pip install --no-cache-dir -e /app/local_packages/
+RUN pip install --no-cache-dir --use-pep517 -r /app/backend/requirements.txt
 
 COPY backend/ /app/backend/
 COPY rag_anything_smaranika/ /app/rag_anything_smaranika/
