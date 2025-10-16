@@ -8,7 +8,7 @@ app_port: 7860
 pinned: false
 license: mit
 ---
-
+  
 # 🤖 Agentic RAG System
 
 A production-ready **Retrieval-Augmented Generation (RAG)** system with multi-domain support, advanced AI features, and intelligent web search integration. Built with FastAPI, React, and Google Gemini API.
